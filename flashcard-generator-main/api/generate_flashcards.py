@@ -69,7 +69,7 @@ def generate_flashcards(text, api_key):
         model="gpt-4o-mini",
         temperature=0.3,
         api_key=api_key,
-        max_tokens=2000
+        max_tokens=800
     )
     chain = prompt | llm | parser
 
