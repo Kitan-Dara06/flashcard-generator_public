@@ -49,6 +49,7 @@ def extract_text_from_pptx(file_content):
         return f"Error reading PPTX: {e}"
 
 # ----- Flashcard generation -----
+# ----- Flashcard generation -----
 def generate_flashcards(text, api_key):
     parser = PydanticOutputParser(pydantic_object=FlashcardList)
     prompt = ChatPromptTemplate.from_messages([
@@ -69,7 +70,7 @@ def generate_flashcards(text, api_key):
         model="gpt-4o-mini",
         temperature=0.3,
         api_key=api_key,
-        max_tokens=2000
+        max_tokens=800
     )
     chain = prompt | llm | parser
 
@@ -79,9 +80,25 @@ def generate_flashcards(text, api_key):
     all_flashcards = []
     for chunk in chunks:
         if chunk.strip():
-            result = chain.invoke({"input_text": chunk})
-            all_flashcards.extend(result.flashcards)
-    return [{"question": c.question, "answer": c.answer} for c in all_flashcards]
+            try:
+                result = chain.invoke({"input_text": chunk})
+                all_flashcards.extend(result.flashcards)
+            except Exception as e:
+                import traceback
+                print(f"Flashcard parsing failed for chunk: {e}")
+                print(traceback.format_exc())
+                continue
+
+    # ✅ Safer handling: supports both dicts and objects
+    flashcards = [
+        {"question": c["question"], "answer": c["answer"]}
+        if isinstance(c, dict) else
+        {"question": getattr(c, "question", ""), "answer": getattr(c, "answer", "")}
+        for c in all_flashcards
+    ]
+
+    return flashcards
+
 
 # ----- Core handler logic -----
 def lambda_handler(event):
@@ -113,8 +130,9 @@ def lambda_handler(event):
                 "body": json.dumps({"success": False, "error": "OpenAI API key not configured"})
             }
 
-        # Parse JSON body
-        content_type = event["headers"].get("content-type", "")
+        # Normalize headers (case-insensitive)
+        headers = {k.lower(): v for k, v in event["headers"].items()}
+        content_type = headers.get("content-type", "")
         if "application/json" not in content_type:
             return {
                 "statusCode": 400,
@@ -122,6 +140,7 @@ def lambda_handler(event):
                 "body": json.dumps({"success": False, "error": "Content-Type must be application/json"})
             }
 
+        # Parse JSON body
         body = json.loads(event["body"])
         file_content = base64.b64decode(body["file_content"])
         file_type = body["file_type"]
@@ -165,6 +184,9 @@ def lambda_handler(event):
         }
 
     except Exception as e:
+        import traceback
+        print("Unhandled error:", str(e))
+        print(traceback.format_exc())
         return {
             "statusCode": 500,
             "headers": {
@@ -173,10 +195,10 @@ def lambda_handler(event):
             },
             "body": json.dumps({
                 "success": False,
-                "error": str(e)
+                "error": str(e),
+                "trace": traceback.format_exc()
             })
         }
-
 # ----- Vercel entrypoint -----
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
