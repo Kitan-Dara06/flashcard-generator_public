@@ -1,2 +1,2 @@
-# flashcard-generator_public
+# flashcard-generator
 A flash card generator
