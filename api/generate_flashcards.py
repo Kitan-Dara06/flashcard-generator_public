@@ -2,6 +2,7 @@
 import json
 import io
 import os
+import re
 import base64
 from typing import List
 import pdfplumber
@@ -11,6 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 
+
 # ----- Pydantic models -----
 class Flashcard(BaseModel):
     question: str = Field(description="The question on the flashcard")
@@ -19,10 +21,58 @@ class Flashcard(BaseModel):
 class FlashcardList(BaseModel):
     flashcards: List[Flashcard] = Field(description="List of flashcards")
 
-# ----- Text extraction -----
-def extract_text_from_pdf(file_content):
+
+# ----- JSON + Parsing Helpers -----
+def clean_json_output(text: str):
+    """Fix common JSON issues like trailing commas before parsing."""
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+def safe_parse_flashcards(result):
+    """Ensure flashcards always have 'question' and 'answer' fields."""
+    repaired = []
+    flashcards = getattr(result, "flashcards", []) if hasattr(result, "flashcards") else result.get("flashcards", [])
+
+    for c in flashcards:
+        if isinstance(c, dict):
+            q = c.get("question", "").strip()
+            a = c.get("answer", "").strip() or "Answer not provided in text."
+        else:  # Pydantic model case
+            q = getattr(c, "question", "").strip()
+            a = getattr(c, "answer", "").strip() or "Answer not provided in text."
+        repaired.append({"question": q, "answer": a})
+    return repaired
+
+def parse_with_json_fallback(raw_output: str):
+    """Fallback: force JSON.loads."""
     try:
+        cleaned = clean_json_output(raw_output)
+        data = json.loads(cleaned)
+        return safe_parse_flashcards(data)
+    except Exception as e:
+        print(f"⚠️ JSON fallback failed: {e}")
+        return []
+
+def try_parse_flashcards(raw_output: str):
+    """Try Pydantic parsing first, then fallback to cleaned JSON."""
+    parser = PydanticOutputParser(pydantic_object=FlashcardList)
+    try:
+        cleaned = clean_json_output(raw_output)
+        parsed = parser.parse(cleaned)
+        if not getattr(parsed, "flashcards", None):
+            raise ValueError("Parsed object missing flashcards")
+        return safe_parse_flashcards(parsed)
+    except Exception as e:
+        print(f"⚠️ Parser failed, using JSON fallback: {e}")
+        return parse_with_json_fallback(raw_output)
+
+
+# ----- Text extraction -----
+def extract_text_from_pdf(file_content, max_pages=50):
+    try:
+        
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+            if len(pdf.pages) > max_pages:
+                raise ValueError(f"File too long: max {max_pages} pages allowed.")
             return "\n".join([page.extract_text() or "" for page in pdf.pages])
     except Exception as e:
         return f"Error reading PDF: {e}"
@@ -48,14 +98,18 @@ def extract_text_from_pptx(file_content):
     except Exception as e:
         return f"Error reading PPTX: {e}"
 
-# ----- Flashcard generation -----
+
 # ----- Flashcard generation -----
 def generate_flashcards(text, api_key):
     parser = PydanticOutputParser(pydantic_object=FlashcardList)
+
     prompt = ChatPromptTemplate.from_messages([
         HumanMessagePromptTemplate.from_template(
             """You are a flashcard generator for theory-based subjects.
             You must ONLY use information that appears in the provided text.
+            Do NOT include trailing commas in objects or arrays.
+            Do NOT repeat or describe the schema.
+            Do NOT output explanations, just valid JSON.
             Generate as many flashcards as possible (aim for at least 20 if content allows).
             Each flashcard must:
             - Have a clear question
@@ -67,37 +121,33 @@ def generate_flashcards(text, api_key):
     ]).partial(format_instructions=parser.get_format_instructions())
 
     llm = ChatOpenAI(
-        model="gpt-4o-mini",
+        model="gpt-3.5-turbo",
         temperature=0.3,
         api_key=api_key,
         max_tokens=800
     )
-    chain = prompt | llm | parser
+    chain = prompt | llm 
 
     # Chunk text to avoid token limits
-    chunk_size = 4000
+    chunk_size = 1500
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     all_flashcards = []
+
     for chunk in chunks:
         if chunk.strip():
             try:
                 result = chain.invoke({"input_text": chunk})
-                all_flashcards.extend(result.flashcards)
+                raw_output = result.content if hasattr(result, "content") else str(result)
+                repaired = try_parse_flashcards(raw_output)
+                all_flashcards.extend(repaired)
             except Exception as e:
                 import traceback
                 print(f"Flashcard parsing failed for chunk: {e}")
                 print(traceback.format_exc())
+                yield [] 
                 continue
 
-    # ✅ Safer handling: supports both dicts and objects
-    flashcards = [
-        {"question": c["question"], "answer": c["answer"]}
-        if isinstance(c, dict) else
-        {"question": getattr(c, "question", ""), "answer": getattr(c, "answer", "")}
-        for c in all_flashcards
-    ]
-
-    return flashcards
+    return all_flashcards
 
 
 # ----- Core handler logic -----
@@ -199,6 +249,8 @@ def lambda_handler(event):
                 "trace": traceback.format_exc()
             })
         }
+
+
 # ----- Vercel entrypoint -----
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -224,3 +276,4 @@ class handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(response["body"].encode())
+
