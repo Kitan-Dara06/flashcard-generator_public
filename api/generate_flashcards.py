@@ -69,13 +69,21 @@ def try_parse_flashcards(raw_output: str):
 # ----- Text extraction -----
 def extract_text_from_pdf(file_content, max_pages=50):
     try:
-        
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
-            if len(pdf.pages) > max_pages:
-                raise ValueError(f"File too long: max {max_pages} pages allowed.")
+            total_pages = len(pdf.pages)
+            if total_pages > max_pages:
+                return {
+                    "error": "document_too_long",
+                    "message": f"Your document has {total_pages} pages. Max allowed: {max_pages}.",
+                    "page_count": total_pages,
+                    "max_allowed": max_pages
+                }
             return "\n".join([page.extract_text() or "" for page in pdf.pages])
     except Exception as e:
-        return f"Error reading PDF: {e}"
+        return {
+            "error": "pdf_extraction_failed",
+            "message": f"Error reading PDF: {str(e)}"
+        }
 
 def extract_text_from_docx(file_content):
     try:
@@ -83,7 +91,10 @@ def extract_text_from_docx(file_content):
         doc = Document(io.BytesIO(file_content))
         return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
     except Exception as e:
-        return f"Error reading DOCX: {e}"
+        return {
+            "error": "docx_extraction_failed",
+            "message": f"Error reading DOCX: {str(e)}"
+        }
 
 def extract_text_from_pptx(file_content):
     try:
@@ -96,7 +107,10 @@ def extract_text_from_pptx(file_content):
                     text.append(shape.text)
         return "\n".join(text)
     except Exception as e:
-        return f"Error reading PPTX: {e}"
+        return {
+            "error": "pptx_extraction_failed",
+            "message": f"Error reading PPTX: {str(e)}"
+        }
 
 
 # ----- Flashcard generation -----
@@ -209,6 +223,11 @@ def lambda_handler(event):
                 "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"success": False, "error": "Unsupported file type"})
             }
+        if isinstance(text, dict) and "error" in text:
+            return {
+            "statusCode": 400,
+            "headers": { ... },
+            "body": json.dumps({ "success": False, **text }}
 
         if not text.strip():
             return {
