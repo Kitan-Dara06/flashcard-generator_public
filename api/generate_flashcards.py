@@ -143,8 +143,7 @@ def generate_flashcards(text, api_key):
             except Exception as e:
                 import traceback
                 print(f"Flashcard parsing failed for chunk: {e}")
-                print(traceback.format_exc())
-                yield [] 
+                print(traceback.format_exc()) 
                 continue
 
     return all_flashcards
