@@ -227,7 +227,7 @@ def lambda_handler(event):
             return {
             "statusCode": 400,
             "headers": { ... },
-            "body": json.dumps({ "success": False, **text }}
+            "body": json.dumps({ "success": False, **text })
 
         if not text.strip():
             return {
