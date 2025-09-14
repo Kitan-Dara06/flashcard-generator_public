@@ -226,8 +226,10 @@ def lambda_handler(event):
         if isinstance(text, dict) and "error" in text:
             return {
             "statusCode": 400,
-            "headers": { ... },
+            "headers": { "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"},
             "body": json.dumps({ "success": False, **text })
+            }
 
         if not text.strip():
             return {
