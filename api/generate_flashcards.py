@@ -4,6 +4,7 @@ import io
 import os
 import re
 import base64
+
 from typing import List
 import pdfplumber
 from http.server import BaseHTTPRequestHandler
@@ -12,7 +13,10 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 
+import logging
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  
 # ----- Pydantic models -----
 class Flashcard(BaseModel):
     question: str = Field(description="The question on the flashcard")
@@ -42,28 +46,23 @@ def safe_parse_flashcards(result):
         repaired.append({"question": q, "answer": a})
     return repaired
 
-def parse_with_json_fallback(raw_output: str):
-    """Fallback: force JSON.loads."""
-    try:
-        cleaned = clean_json_output(raw_output)
-        data = json.loads(cleaned)
-        return safe_parse_flashcards(data)
-    except Exception as e:
-        print(f"⚠️ JSON fallback failed: {e}")
-        return []
 
-def try_parse_flashcards(raw_output: str):
-    """Try Pydantic parsing first, then fallback to cleaned JSON."""
-    parser = PydanticOutputParser(pydantic_object=FlashcardList)
-    try:
-        cleaned = clean_json_output(raw_output)
-        parsed = parser.parse(cleaned)
-        if not getattr(parsed, "flashcards", None):
-            raise ValueError("Parsed object missing flashcards")
-        return safe_parse_flashcards(parsed)
-    except Exception as e:
-        print(f"⚠️ Parser failed, using JSON fallback: {e}")
-        return parse_with_json_fallback(raw_output)
+def is_valid_flashcard_list(data):
+    if not isinstance(data, dict):
+        return False
+    flashcards = data.get("flashcards")
+    if not isinstance(flashcards, list):
+        return False
+    for item in flashcards:
+        if not isinstance(item, dict):
+            return False
+        # Check that both fields exist AND are non-empty after stripping
+        question = item.get("question", "").strip()
+        answer = item.get("answer", "").strip()
+        if not question or not answer:
+            return False
+    return True
+
 
 
 # ----- Text extraction -----
@@ -95,18 +94,15 @@ def extract_text_from_docx(file_content):
             "error": "docx_extraction_failed",
             "message": f"Error reading DOCX: {str(e)}"
         }
-def is_valid_flashcard_list(data):
-    if not isinstance(data, dict):
-        return False
-    flashcards = data.get("flashcards")
-    if not isinstance(flashcards, list):
-        return False
+def filter_valid_flashcards(flashcards):
+    valid = []
     for item in flashcards:
-        if not isinstance(item, dict):
-            return False
-        if not item.get("question") or not item.get("answer"):
-            return False
-    return True
+        if isinstance(item, dict):
+            q = item.get("question", "").strip()
+            a = item.get("answer", "").strip()
+            if q and a:
+                valid.append({"question": q, "answer": a})
+    return valid
     
 def extract_text_from_pptx(file_content):
     try:
@@ -126,55 +122,61 @@ def extract_text_from_pptx(file_content):
 
 
 # ----- Flashcard generation -----
-def generate_flashcards(text, api_key):
-    # parser = PydanticOutputParser(pydantic_object=FlashcardList)
 
+def generate_flashcards(text, api_key):
     prompt = ChatPromptTemplate.from_messages([
         HumanMessagePromptTemplate.from_template(
             """You are a flashcard generator for theory-based subjects.
-            Output a valid JSON object with a key "flashcards" containing a list of flashcards.
-            Each flashcard must have:
-              - "question": a clear, concise question (string)
-              - "answer": a 2–3 sentence explanatory answer (string)
-              - Stay strictly factual, based only on the provided text
-            Do not include any other text, markdown, or commentary.
-            Generate as many flashcards as possible (aim for at least 20 if content allows).
-            Text: {input_text}"""
+Output a valid JSON object with a key "flashcards" containing a list of flashcards.
+Each flashcard must have:
+  - "question": a clear, concise question (string)
+  - "answer": a 2–3 sentence explanatory answer (string)
+Stay strictly factual, based only on the provided text.
+If the text contains no usable information, output {"flashcards": []}.
+Do not explain, apologize, or return any text outside the JSON object.
+
+Text:
+{input_text}"""
         )
     ])
+    
     llm = ChatOpenAI(
         model="gpt-4o",
         temperature=0.3,
         api_key=api_key,
         response_format={"type": "json_object"},
-        max_tokens=2000
+        max_tokens=4000
     )
     chain = prompt | llm 
 
-    # Chunk text to avoid token limits
-    chunk_size = 3500
+    
+    CHARS_PER_TOKEN = 4  
+    MAX_INPUT_TOKENS = 6000
+    chunk_size = MAX_INPUT_TOKENS * CHARS_PER_TOKEN  
+    
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     all_flashcards = [] 
     
-    for chunk in chunks:
-        if chunk.strip():
-            try:
-                result = chain.invoke({"input_text": chunk})
-                data = json.loads(result.content)
-                if not is_valid_flashcard_list(data):
-                  print("⚠️ Invalid flashcard structure")
-                  continue
-                flashcards = safe_parse_flashcards(data)
+    for i, chunk in enumerate(chunks, 1):
+        if not chunk.strip():
+            continue
+            
+        try:
+            logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
+            result = chain.invoke({"input_text": chunk})
+            raw = result.content.strip()
+            
+            data = json.loads(raw)
+            
+            flashcards_raw = data.get("flashcards", [])
+            flashcards = filter_valid_flashcards(flashcards_raw)
+            if flashcards:  # Only add if we got valid flashcards
                 all_flashcards.extend(flashcards)
-            except Exception as e:
-                import traceback
-                print(f"Flashcard parsing failed for chunk: {e}")
-                print(traceback.format_exc()) 
-                continue
-
-    return all_flashcards
-
-
+                logger.info(f"Chunk {i}: Generated {len(flashcards)} flashcards")
+            else:
+                 logger.warning(f"Chunk {i}: No valid flashcards generated")
+    return all_flashcards 
+           
 # ----- Core handler logic -----
 def lambda_handler(event):
     try:
