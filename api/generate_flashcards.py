@@ -95,7 +95,19 @@ def extract_text_from_docx(file_content):
             "error": "docx_extraction_failed",
             "message": f"Error reading DOCX: {str(e)}"
         }
-
+def is_valid_flashcard_list(data):
+    if not isinstance(data, dict):
+        return False
+    flashcards = data.get("flashcards")
+    if not isinstance(flashcards, list):
+        return False
+    for item in flashcards:
+        if not isinstance(item, dict):
+            return False
+        if not item.get("question") or not item.get("answer"):
+            return False
+    return True
+    
 def extract_text_from_pptx(file_content):
     try:
         from pptx import Presentation
@@ -115,45 +127,45 @@ def extract_text_from_pptx(file_content):
 
 # ----- Flashcard generation -----
 def generate_flashcards(text, api_key):
-    parser = PydanticOutputParser(pydantic_object=FlashcardList)
+    # parser = PydanticOutputParser(pydantic_object=FlashcardList)
 
     prompt = ChatPromptTemplate.from_messages([
         HumanMessagePromptTemplate.from_template(
             """You are a flashcard generator for theory-based subjects.
-            You must ONLY use information that appears in the provided text.
-            Do NOT include trailing commas in objects or arrays.
-            Do NOT repeat or describe the schema.
-            Do NOT output explanations, just valid JSON.
+            Output a valid JSON object with a key "flashcards" containing a list of flashcards.
+            Each flashcard must have:
+              - "question": a clear, concise question (string)
+              - "answer": a 2–3 sentence explanatory answer (string)
+              - Stay strictly factual, based only on the provided text
+            Do not include any other text, markdown, or commentary.
             Generate as many flashcards as possible (aim for at least 20 if content allows).
-            Each flashcard must:
-            - Have a clear question
-            - Provide a 2-3 sentence answer
-            - Stay strictly factual, based only on the provided text
-            {format_instructions}
             Text: {input_text}"""
         )
-    ]).partial(format_instructions=parser.get_format_instructions())
-
+    ])
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4o",
         temperature=0.3,
         api_key=api_key,
-        max_tokens=800
+        response_format={"type": "json_object"},
+        max_tokens=2000
     )
     chain = prompt | llm 
 
     # Chunk text to avoid token limits
-    chunk_size = 1500
+    chunk_size = 3500
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    all_flashcards = []
-
+    all_flashcards = [] 
+    
     for chunk in chunks:
         if chunk.strip():
             try:
                 result = chain.invoke({"input_text": chunk})
-                raw_output = result.content if hasattr(result, "content") else str(result)
-                repaired = try_parse_flashcards(raw_output)
-                all_flashcards.extend(repaired)
+                data = json.loads(result.content)
+                if not is_valid_flashcard_list(data):
+                  print("⚠️ Invalid flashcard structure")
+                  continue
+                flashcards = safe_parse_flashcards(data)
+                all_flashcards.extend(flashcards)
             except Exception as e:
                 import traceback
                 print(f"Flashcard parsing failed for chunk: {e}")
