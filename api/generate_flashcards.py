@@ -12,9 +12,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
-
 import logging
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  
 # ----- Pydantic models -----
@@ -46,27 +44,35 @@ def safe_parse_flashcards(result):
         repaired.append({"question": q, "answer": a})
     return repaired
 
+def parse_with_json_fallback(raw_output: str):
+    """Fallback: force JSON.loads."""
+    try:
+        cleaned = clean_json_output(raw_output)
+        data = json.loads(cleaned)
+        return safe_parse_flashcards(data)
+    except Exception as e:
+        print(f"⚠️ JSON fallback failed: {e}")
+        return []
 
-def is_valid_flashcard_list(data):
-    if not isinstance(data, dict):
-        return False
-    flashcards = data.get("flashcards")
-    if not isinstance(flashcards, list):
-        return False
-    for item in flashcards:
-        if not isinstance(item, dict):
-            return False
-        # Check that both fields exist AND are non-empty after stripping
-        question = item.get("question", "").strip()
-        answer = item.get("answer", "").strip()
-        if not question or not answer:
-            return False
-    return True
+def try_parse_flashcards(raw_output: str):
+    """Try Pydantic parsing first, then fallback to cleaned JSON."""
+    parser = PydanticOutputParser(pydantic_object=FlashcardList)
+    try:
+        cleaned = clean_json_output(raw_output)
+        parsed = parser.parse(cleaned)
+        if not getattr(parsed, "flashcards", None):
+            raise ValueError("Parsed object missing flashcards")
+        return safe_parse_flashcards(parsed)
+    except Exception as e:
+        print(f"⚠️ Parser failed, using JSON fallback: {e}")
+        return parse_with_json_fallback(raw_output)
+
+
 
 
 
 # ----- Text extraction -----
-def extract_text_from_pdf(file_content, max_pages=50):
+def extract_text_from_pdf(file_content, max_pages=100):
     try:
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
             total_pages = len(pdf.pages)
@@ -149,7 +155,6 @@ Text:
     )
     chain = prompt | llm 
 
-    
     CHARS_PER_TOKEN = 4  
     MAX_INPUT_TOKENS = 6000
     chunk_size = MAX_INPUT_TOKENS * CHARS_PER_TOKEN  
@@ -169,13 +174,20 @@ Text:
             data = json.loads(raw)
             
             flashcards_raw = data.get("flashcards", [])
-            flashcards = filter_valid_flashcards(flashcards_raw)
+            if not filter_valid_flashcards(flashcards_raw):
+                print("Invalid flashcard structure")
+                continue
+            flashcards = safe_parse_flashcards(flashcards_raw)
             if flashcards:  # Only add if we got valid flashcards
                 all_flashcards.extend(flashcards)
                 logger.info(f"Chunk {i}: Generated {len(flashcards)} flashcards")
             else:
-                 logger.warning(f"Chunk {i}: No valid flashcards generated")
-    return all_flashcards 
+                logger.warning(f"Chunk {i}: No valid flashcards generated")
+        except Exception as e:
+            logger.error(f"Error processing chunk {i}: {e}")
+            continue  # Skip failed chunks
+
+    return all_flashcards
            
 # ----- Core handler logic -----
 def lambda_handler(event):
