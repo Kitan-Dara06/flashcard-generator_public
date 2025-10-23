@@ -130,10 +130,9 @@ def extract_text_from_pptx(file_content):
 # ----- Flashcard generation -----
 
 def generate_flashcards(text, api_key):
-    prompt = ChatPromptTemplate.from_messages([
-        HumanMessagePromptTemplate.from_template(
-            """You are a flashcard generator for theory-based subjects.
-Output a valid JSON object with a key "flashcards" containing a list of flashcards.
+    client = OpenAI(api_key=api_key)
+    prompt =  """You are a flashcard generator for theory-based subjects.
+  Output a valid JSON object with a key "flashcards" containing a list of flashcards.
 Each flashcard must have:
   - "question": a clear, concise question (string)
   - "answer": a 2–3 sentence explanatory answer (string)
@@ -143,17 +142,6 @@ Do not explain, apologize, or return any text outside the JSON object.
 
 Text:
 {input_text}"""
-        )
-    ])
-    
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.3,
-        api_key=api_key,
-        response_format={"type": "json_object"},
-        max_tokens=4000
-    )
-    chain = prompt | llm 
 
     CHARS_PER_TOKEN = 4  
     MAX_INPUT_TOKENS = 6000
@@ -168,8 +156,19 @@ Text:
             
         try:
             logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-            result = chain.invoke({"input_text": chunk})
-            raw = result.content.strip()
+            prompt = prompt_template.format(input_text=chunk)
+            response = client.chat.completions.create(
+                model = "gpt-4o",
+                temperature = 0.3,
+                max_tokens = 4000,
+                response_format = {"type":"json_object"},
+                messages = [
+               {"role": "system", "content": SYSTEM_PROMPT},
+               {"role": "user", "content": f"Text:\n{chunk}"}
+                ]
+                )
+                                
+            raw = response.choices[0].message.content.strip()
             
             data = json.loads(raw)
             
