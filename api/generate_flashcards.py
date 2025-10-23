@@ -129,7 +129,7 @@ def extract_text_from_pptx(file_content):
 
 def generate_flashcards(text, api_key):
     client = OpenAI(api_key=api_key)
-    prompt =  """You are a flashcard generator for theory-based subjects.
+    prompt_template =  """You are a flashcard generator for theory-based subjects.
   Output a valid JSON object with a key "flashcards" containing a list of flashcards.
 Each flashcard must have:
   - "question": a clear, concise question (string)
@@ -154,15 +154,14 @@ Text:
             
         try:
             logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-            prompt = prompt_template.format(input_text=chunk)
+            formatted_prompt= prompt_template.format(input_text=chunk)
             response = client.chat.completions.create(
                 model = "gpt-4o",
                 temperature = 0.3,
                 max_tokens = 4000,
                 response_format = {"type":"json_object"},
                 messages = [
-               {"role": "system", "content": SYSTEM_PROMPT},
-               {"role": "user", "content": f"Text:\n{chunk}"}
+                {"role": "user", "content": formatted_prompt}
                 ]
                 )
                                 
