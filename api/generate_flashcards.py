@@ -139,7 +139,7 @@ If the text contains no usable information, output {"flashcards": []}.
 Do not explain, apologize, or return any text outside the JSON object.
 
 Text:
-{input_text}"""
+"""
 
     CHARS_PER_TOKEN = 4  
     MAX_INPUT_TOKENS = 6000
@@ -154,7 +154,7 @@ Text:
             
         try:
             logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-            formatted_prompt= prompt_template.format(input_text=chunk)
+            formatted_prompt = prompt_prefix + chunk
             response = client.chat.completions.create(
                 model = "gpt-4o",
                 temperature = 0.3,
