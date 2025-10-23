@@ -166,23 +166,46 @@ Text:
                 )
                                 
             raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(json)?", "", raw)
+                raw = raw.replace("```", "").strip()
+            logger.info(f"Raw response from API: {raw[:500]}") 
             
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except:
+                logger.warning(f"Chunk {i}: JSON decode failed, trying fallback")
+                cleaned = re.sub(r",(\s*[}\]])", r"\1", raw) 
+                data = json.loads(cleaned)
+                
             
-            flashcards_raw = data.get("flashcards", [])
-            if not filter_valid_flashcards(flashcards_raw):
-                print("Invalid flashcard structure")
+            logger.debug(f"Parsed JSON keys: {list(data.keys())}")
+            if "flashcards" not in data:
+                logger.warning(f"Chunk {i}: Response missing 'flashcards' key. Keys found: {list(data.keys())}")
                 continue
+            
+            flashcards_raw = data["flashcards"]
+            if not isinstance(flashcards_raw, list):
+                logger.warning(f"Chunk {i}: 'flashcards' is not a list, got {type(flashcards_raw)}")
+                continue
+            # if not filter_valid_flashcards(flashcards_raw):
+            #     logger.warning(f"Chunk {i}: Invalid flashcard structure")
+            #     continue
             flashcards = safe_parse_flashcards(flashcards_raw)
             if flashcards:  # Only add if we got valid flashcards
                 all_flashcards.extend(flashcards)
                 logger.info(f"Chunk {i}: Generated {len(flashcards)} flashcards")
             else:
                 logger.warning(f"Chunk {i}: No valid flashcards generated")
+        except json.JSONDecodeError as e:
+            logger.error(f"Chunk {i}: JSON decode error - {e}")
+            logger.error(f"Raw response was: {raw[:500]}")
+            continue
         except Exception as e:
-            logger.error(f"Error processing chunk {i}: {e}")
-            continue  # Skip failed chunks
-
+                logger.error(f"Chunk {i}: Unexpected error - {type(e).__name__}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                continue
     return all_flashcards
            
 # ----- Core handler logic -----
