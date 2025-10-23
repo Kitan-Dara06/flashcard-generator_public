@@ -27,7 +27,7 @@ def clean_json_output(text: str):
     """Fix common JSON issues like trailing commas before parsing."""
     return re.sub(r",(\s*[}\]])", r"\1", text)
 
-def safe_parse_flashcards(result):
+def safe_parse_flashcards(flashcards_list):
     """Ensure flashcards always have 'question' and 'answer' fields."""
     repaired = []
     if hasattr(flashcards_list, "flashcards"): 
