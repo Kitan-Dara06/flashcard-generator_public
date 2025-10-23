@@ -154,7 +154,7 @@ Text:
             
         try:
             logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-            formatted_prompt = prompt_prefix + chunk
+            formatted_prompt =  prompt_template  + chunk
             response = client.chat.completions.create(
                 model = "gpt-4o",
                 temperature = 0.3,
