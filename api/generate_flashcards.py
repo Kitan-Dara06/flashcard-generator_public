@@ -4,13 +4,11 @@ import io
 import os
 import re
 import base64
-
+from openai import OpenAI
 from typing import List
 import pdfplumber
 from http.server import BaseHTTPRequestHandler
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+
 from pydantic import BaseModel, Field
 import logging
 logger = logging.getLogger(__name__)
