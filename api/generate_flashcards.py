@@ -30,7 +30,14 @@ def clean_json_output(text: str):
 def safe_parse_flashcards(result):
     """Ensure flashcards always have 'question' and 'answer' fields."""
     repaired = []
-    flashcards = getattr(result, "flashcards", []) if hasattr(result, "flashcards") else result.get("flashcards", [])
+    if hasattr(flashcards_list, "flashcards"): 
+         flashcards = flashcards_list.flashcards
+    elif isinstance(flashcards_list, dict): 
+         flashcards = flashcards_list.get("flashcards", [])
+    elif isinstance(flashcards_list, list):  # Already a list
+         flashcards = flashcards_list
+    else:
+        return []
 
     for c in flashcards:
         if isinstance(c, dict):
@@ -39,7 +46,9 @@ def safe_parse_flashcards(result):
         else:  # Pydantic model case
             q = getattr(c, "question", "").strip()
             a = getattr(c, "answer", "").strip() or "Answer not provided in text."
-        repaired.append({"question": q, "answer": a})
+
+        if q and a:
+             repaired.append({"question": q, "answer": a})
     return repaired
 
 def parse_with_json_fallback(raw_output: str):
