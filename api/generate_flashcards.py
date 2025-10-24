@@ -140,7 +140,7 @@ def generate_flashcards(text, api_key):
     client = OpenAI(api_key=api_key)
     prompt_template =  """You are a flashcard generator for theory-based subjects.
   Output a valid JSON object with a key "flashcards" containing a list of flashcards.
-  Generate as many flashcards as possible, nothing less than 20 flashcards.
+Generate as many flashcards as possible (aim for at least 30 if content allows)
 Each flashcard must have:
   - "question": a clear, concise question (string)
   - "answer": a 2–3 sentence explanatory answer (string)
