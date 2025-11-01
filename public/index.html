@@ -7,6 +7,14 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <div id="passwordOverlay" class="password-overlay">
+      <div class="password-prompt">
+            <h2>🔒 Enter Password</h2>
+            <input type="password" id="passwordInput" placeholder="Password" autocomplete="off" />
+            <button id="passwordSubmit">Submit</button>
+            <p id="passwordError" class="password-error hidden">❌ Incorrect password</p>
+      </div>
+    </div>
     <div class="container">
         <header>
             <h1>🎯 AI Flashcard Generator</h1>
@@ -43,8 +51,10 @@
             
             <div id="error" class="error hidden"></div>
         </main>
-    </div>
+  
     
     <script src="script.js"></script>
 </body>
+  
+</div>
 </html>
