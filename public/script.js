@@ -1,4 +1,65 @@
 document.addEventListener('DOMContentLoaded', function() {
+    const passwordOverlay = document.getElementById('passwordOverlay');
+    const passwordInput = document.getElementById('passwordInput');
+    const passwordSubmit = document.getElementById('passwordSubmit');
+    const passwordError = document.getElementById('passwordError');
+    const isAuthenticated = sessionStorage.getItem('authenticated') === 'true';
+    if (isAuthenticated) {
+        passwordOverlay.classList.add('hidden');
+    }
+    passwordSubmit.addEventListener('click', checkPassword);
+    passwordInput.addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            checkPassword();
+        }
+    });
+    async function checkPassword() {
+        const enteredPassword = passwordInput.value;
+        try {
+            const response = await fetch('/api/verify_password', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+
+                body: JSON.stringify({
+                    password: enteredPassword
+                })
+            });
+            const data = await response.json();
+            if (data.success && data.authenticated) {
+
+                sessionStorage.setItem('authenticated', 'true');
+
+                passwordOverlay.classList.add('hidden');
+
+                passwordError.classList.add('hidden');
+
+                passwordInput.value = '';
+
+            } else {
+
+                passwordError.classList.remove('hidden');
+
+                passwordInput.value = '';
+
+                passwordInput.focus();
+
+            }
+
+        } catch (error) {
+
+            passwordError.textContent = '❌ Error verifying password';
+
+            passwordError.classList.remove('hidden');
+
+            passwordInput.value = '';
+
+        }
+
+    }
+
+   
     const fileInput = document.getElementById('fileInput');
     const generateBtn = document.getElementById('generateBtn');
     const loading = document.getElementById('loading');
