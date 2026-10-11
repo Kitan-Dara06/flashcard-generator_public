@@ -65,15 +65,27 @@ Upload a PDF, TXT, DOCX, or PPTX and get an AI-generated deck of flashcards you 
 | POST | `/api/generate_flashcards` | Submit a document; returns a `job_id` |
 | GET | `/api/status?job_id=…` | Poll status / progress / results |
 | POST | `/api/cancel` | Cancel a running job (body: `{job_id}`) |
+| POST | `/api/tts` | Synthesize one sentence to WAV audio (body: `{text}`) |
 | POST | `/api/warmup` | Pre-warm the Modal GPU container |
 
 All endpoints except `verify_password` require `Authorization: Bearer <token>`.
+
+## Text to speech
+
+Each flashcard has a 🔊 button on both faces (plus an **Auto-read** toggle that reads the side you flip to).
+
+- **Engine**: Piper (`piper-tts`), an English neural voice (`en_US-lessac-medium`) running on **CPU inside the same Modal container** as the LLM — no second cold start, and the GPU stays free for vLLM. Only ~500 MB on top of the image.
+- **Streaming**: browsers can't reliably play a half-downloaded WAV, so instead the frontend splits text into sentences and **pipelines** the requests — sentence N plays while sentence N+1 is already downloading. Playback typically starts in ~300-500 ms.
+- **Caching**: `/api/tts` hashes `voice + text` and caches the WAV in Redis for 7 days, so re-studying a deck is free. The browser also keeps an in-memory cache for the session.
+- **Interruptions**: starting a new clip aborts in-flight requests and stops the current audio, so rapid clicks never queue up. Speech also stops when the tab is hidden or a new generation starts.
+- **Voice**: change `TTS_VOICE` in `modal_app.py` (and `api/tts.py`, which must match) to any voice from the `rhasspy/piper-voices` repo, then `modal deploy`. The new voice downloads into the volume on first use.
 
 ## Limits & tuning
 
 - Uploads are capped at 3 MB client-side (Vercel request bodies max out at ~4.5 MB).
 - `api/generate_flashcards.py`: `MAX_PAGES = 100`, `MAX_TEXT_CHARS = 500_000`.
-- `modal_app.py`: `MAX_CHUNK_CHARS = 24_000`, `SIM_BOUNDARY_THRESHOLD`, `DEDUP_THRESHOLD`, cron schedule, `STUDY_TIMEZONE`.
+- `modal_app.py`: `MAX_CHUNK_CHARS = 24_000`, `SIM_BOUNDARY_THRESHOLD`, `DEDUP_THRESHOLD`, `TTS_VOICE`, cron schedule, `STUDY_TIMEZONE`.
+- `api/tts.py`: `TTS_MAX_CHARS = 600` per request, `TTS_CACHE_TTL = 7 days`, `TTS_CACHE_MAX_BYTES = 400 KB` (clips larger than this are streamed but not cached, to respect Redis value limits).
 
 ## Local development
 

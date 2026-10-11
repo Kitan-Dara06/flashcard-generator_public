@@ -59,7 +59,13 @@
             <div id="results" class="results hidden">
                 <div class="results-header">
                     <h2 id="resultsCount"></h2>
-                    <button id="downloadBtn" class="download-btn">💾 Download JSON</button>
+                    <div class="results-actions">
+                        <label class="autoplay-toggle" title="Read each side aloud when you flip a card">
+                            <input type="checkbox" id="autoplayToggle" />
+                            <span>🔊 Auto-read</span>
+                        </label>
+                        <button id="downloadBtn" class="download-btn">💾 Download JSON</button>
+                    </div>
                 </div>
                 <p class="results-hint">Click a card to flip it. Questions on the front, answers on the back.</p>
                 <div id="flashcards" class="flashcard-container"></div>

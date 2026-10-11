@@ -230,6 +230,9 @@ def lambda_handler(event):
         try:
             dispatch_job(job_id)
         except Exception as exc:
+            import traceback
+            print("Dispatch to Modal failed:", repr(exc))
+            print(traceback.format_exc())
             r.set(f"job:{job_id}:error", f"Dispatch failed: {exc}", ex=JOB_TTL_SECONDS)
             r.set(f"job:{job_id}:status", "error", ex=JOB_TTL_SECONDS)
             return {

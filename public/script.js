@@ -18,6 +18,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const flashcardsContainer = document.getElementById('flashcards');
     const resultsCount = document.getElementById('resultsCount');
     const downloadBtn = document.getElementById('downloadBtn');
+    const autoplayToggle = document.getElementById('autoplayToggle');
 
     const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;   // base64 inflates ~33%; Vercel caps bodies at 4.5 MB
     const POLL_INTERVAL_MS = 2000;
@@ -80,6 +81,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function expireAuth() {
         stopPolling();
+        stopSpeaking();
         hideLoading();
         authToken = null;
         sessionStorage.removeItem('authToken');
@@ -102,7 +104,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
     window.addEventListener('load', warmupNow);
     document.addEventListener('visibilitychange', function() {
-        if (!document.hidden) warmupNow();
+        if (document.hidden) {
+            stopSpeaking();   // don't talk to an empty room
+        } else {
+            warmupNow();
+        }
     });
 
     /* ---------------- file selection ---------------- */
@@ -308,6 +314,142 @@ document.addEventListener('DOMContentLoaded', function() {
         currentJobId = null;
     }
 
+    /* ---------------- text to speech ---------------- */
+
+    const TTS_MAX_CHARS = 600;
+    const audioUrlCache = new Map();   // sentence -> object URL (session cache)
+    let audioEl = null;
+    let speakToken = 0;
+    const ttsAborts = new Set();
+
+    autoplayToggle.checked = localStorage.getItem('autoplay') === 'true';
+    autoplayToggle.addEventListener('change', function() {
+        localStorage.setItem('autoplay', autoplayToggle.checked ? 'true' : 'false');
+        if (!autoplayToggle.checked) stopSpeaking();
+    });
+
+    // Split into sentences, then merge short ones so each request is a
+    // sensible chunk (~1-2 sentences) and hard-split anything oversized.
+    function splitSentences(text) {
+        const cleaned = (text || '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) return [];
+        const parts = cleaned.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+        const merged = [];
+        let buffer = '';
+        parts.forEach(function(part) {
+            const sentence = part.trim();
+            if (!sentence) return;
+            if (buffer && buffer.length + sentence.length > 220) {
+                merged.push(buffer);
+                buffer = sentence;
+            } else {
+                buffer = buffer ? buffer + ' ' + sentence : sentence;
+            }
+        });
+        if (buffer) merged.push(buffer);
+
+        const out = [];
+        merged.forEach(function(chunk) {
+            if (chunk.length <= 320) {
+                out.push(chunk);
+            } else {
+                (chunk.match(/[\s\S]{1,320}(?:\s|$)/g) || []).forEach(function(piece) {
+                    const trimmed = piece.trim();
+                    if (trimmed) out.push(trimmed);
+                });
+            }
+        });
+        return out;
+    }
+
+    function stopSpeaking() {
+        speakToken += 1;
+        ttsAborts.forEach(function(controller) {
+            try { controller.abort(); } catch (e) { /* already done */ }
+        });
+        ttsAborts.clear();
+        if (audioEl) {
+            try { audioEl.pause(); } catch (e) { /* not playing */ }
+            audioEl.removeAttribute('src');
+        }
+        document.querySelectorAll('.speak-btn.playing').forEach(function(btn) {
+            btn.classList.remove('playing');
+        });
+    }
+
+    function fetchAudioUrl(sentence) {
+        if (audioUrlCache.has(sentence)) {
+            return Promise.resolve(audioUrlCache.get(sentence));
+        }
+        const controller = new AbortController();
+        ttsAborts.add(controller);
+        return fetch('/api/tts', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + authToken
+            },
+            body: JSON.stringify({ text: sentence.slice(0, TTS_MAX_CHARS) }),
+            signal: controller.signal
+        }).then(function(response) {
+            if (response.status === 401) { expireAuth(); return null; }
+            if (!response.ok) throw new Error('tts ' + response.status);
+            return response.blob();
+        }).then(function(blob) {
+            if (!blob) return null;
+            const url = URL.createObjectURL(blob);
+            if (audioUrlCache.size < 300) audioUrlCache.set(sentence, url);
+            return url;
+        }).finally(function() {
+            ttsAborts.delete(controller);
+        });
+    }
+
+    function playUrl(url) {
+        return new Promise(function(resolve) {
+            if (!audioEl) audioEl = new Audio();
+            audioEl.onended = resolve;
+            audioEl.onerror = resolve;
+            audioEl.src = url;
+            audioEl.play().catch(resolve);   // autoplay policy: gesture already happened
+        });
+    }
+
+    // Stream-by-pipelining: play sentence N while sentence N+1 is already downloading.
+    async function speakText(text, button) {
+        stopSpeaking();
+        const token = ++speakToken;
+        const sentences = splitSentences(text);
+        if (!sentences.length) return;
+        if (button) button.classList.add('playing');
+
+        try {
+            let pending = fetchAudioUrl(sentences[0]);
+            for (let i = 0; i < sentences.length; i++) {
+                const current = pending;
+                pending = i + 1 < sentences.length ? fetchAudioUrl(sentences[i + 1]) : null;
+
+                let url = null;
+                try {
+                    url = await current;
+                } catch (err) {
+                    if (token === speakToken) console.warn('TTS fetch failed', err);
+                }
+                if (token !== speakToken) return;
+                if (!url) continue;
+
+                await playUrl(url);
+                if (token !== speakToken) return;
+            }
+        } finally {
+            if (token === speakToken) {
+                document.querySelectorAll('.speak-btn.playing').forEach(function(btn) {
+                    btn.classList.remove('playing');
+                });
+            }
+        }
+    }
+
     /* ---------------- rendering ---------------- */
 
     downloadBtn.addEventListener('click', function() {
@@ -337,6 +479,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     function showLoading(text) {
+        stopSpeaking();
         loading.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
         results.classList.add('hidden');
@@ -356,6 +499,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     function showResults(flashcards) {
+        stopSpeaking();
         hideLoading();
         setProgress(-1);
         results.classList.remove('hidden');
@@ -371,6 +515,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     function showError(message) {
+        stopSpeaking();
         hideLoading();
         setProgress(-1);
         results.classList.add('hidden');
@@ -381,28 +526,45 @@ document.addEventListener('DOMContentLoaded', function() {
     function createFlashcardElement(card, number) {
         const flashcard = document.createElement('div');
         flashcard.className = 'flashcard';
-        flashcard.style.animationDelay = Math.min(index0(number), 500) + 'ms';
+        flashcard.style.animationDelay = Math.min((number - 1) * 18, 500) + 'ms';
 
         flashcard.innerHTML = `
-            <div class="flashcard-inner" onclick="this.classList.toggle('flip')">
+            <div class="flashcard-inner">
                 <div class="flashcard-front">
                     <div class="flashcard-number">Q${number}</div>
+                    <button class="speak-btn" type="button" title="Read aloud" aria-label="Read question aloud">🔊</button>
                     <div>${escapeHtml(card.question)}</div>
                     <div class="flashcard-hint">click to flip</div>
                 </div>
                 <div class="flashcard-back">
                     <div class="flashcard-number">A${number}</div>
+                    <button class="speak-btn" type="button" title="Read aloud" aria-label="Read answer aloud">🔊</button>
                     <div>${escapeHtml(card.answer)}</div>
                     <div class="flashcard-hint">click to flip back</div>
                 </div>
             </div>
         `;
 
+        const inner = flashcard.querySelector('.flashcard-inner');
+        inner.addEventListener('click', function() {
+            inner.classList.toggle('flip');
+            if (autoplayToggle.checked) {
+                const showingAnswer = inner.classList.contains('flip');
+                speakText(showingAnswer ? card.answer : card.question, null);
+            }
+        });
+
+        flashcard.querySelector('.flashcard-front .speak-btn').addEventListener('click', function(e) {
+            e.stopPropagation();
+            speakText(card.question, e.currentTarget);
+        });
+        flashcard.querySelector('.flashcard-back .speak-btn').addEventListener('click', function(e) {
+            e.stopPropagation();
+            speakText(card.answer, e.currentTarget);
+        });
+
         return flashcard;
     }
-
-    // Stagger card entrance animation without leaking `index` into helper scope
-    function index0(oneBased) { return (oneBased - 1) * 18; }
 
     function escapeHtml(text) {
         const div = document.createElement('div');

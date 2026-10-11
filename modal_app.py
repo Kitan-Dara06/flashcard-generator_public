@@ -17,6 +17,7 @@ Before deploying:
 import json
 import os
 import re
+import struct
 
 import modal
 
@@ -30,6 +31,10 @@ MAX_CHUNK_CHARS = 24_000        # ~6k tokens per chunk
 SIM_BOUNDARY_THRESHOLD = 0.5    # adjacent-block similarity below this: topic boundary
 DEDUP_THRESHOLD = 0.92          # question similarity above this: duplicate card
 REDIS_TTL_SECONDS = 24 * 60 * 60
+
+# Text-to-speech (Piper, runs on CPU in this same container)
+TTS_VOICE_REPO = "rhasspy/piper-voices"
+TTS_VOICE = "en_US-lessac-medium"   # <-- change to any rhasspy/piper-voices voice
 
 SYSTEM_PROMPT = """You are a flashcard generator for theory-based subjects.
 Generate as many flashcards as possible from the user's text (aim for at least 30 if the content allows).
@@ -48,6 +53,7 @@ image = (
     .pip_install(
         "vllm==0.6.6",
         "sentence-transformers>=3.0.0",
+        "piper-tts>=1.2.0",
         "upstash-redis>=1.0.0",
     )
     .env({"HF_HOME": "/cache"})
@@ -83,6 +89,29 @@ def _dot(a, b) -> float:
     return float(sum(x * y for x, y in zip(a, b)))
 
 
+def _voice_paths(voice: str) -> tuple[str, str]:
+    """Map 'en_US-lessac-medium' to its two files in the piper-voices repo."""
+    locale, name, quality = voice.split("-")
+    lang = locale.split("_")[0]
+    base = f"{lang}/{locale}/{name}/{quality}/{voice}"
+    return f"{base}.onnx", f"{base}.onnx.json"
+
+
+def _wav_bytes(pcm: bytes, sample_rate: int, sample_width: int, channels: int) -> bytes:
+    """Wrap raw 16-bit PCM in a minimal WAV container."""
+    byte_rate = sample_rate * channels * sample_width
+    block_align = channels * sample_width
+    return b"".join([
+        b"RIFF",
+        struct.pack("<I", 36 + len(pcm)),
+        b"WAVEfmt ",
+        struct.pack("<IHHIIHH", 16, 1, channels, sample_rate, byte_rate, block_align, sample_width * 8),
+        b"data",
+        struct.pack("<I", len(pcm)),
+        pcm,
+    ])
+
+
 @app.cls(
     image=image,
     gpu="A10G",
@@ -116,10 +145,37 @@ class FlashcardLLM:
         # bge-small runs on CPU: it's tiny, and keeps the GPU free for vLLM.
         self.embedder = SentenceTransformer(EMBED_MODEL)
 
+        # Piper TTS also runs on CPU, co-located so it shares the container
+        # (and therefore the warm/snapshot lifecycle) with the LLM.
+        from huggingface_hub import hf_hub_download
+        from piper.voice import PiperVoice
+
+        onnx_file, config_file = _voice_paths(TTS_VOICE)
+        self.tts = PiperVoice.load(
+            hf_hub_download(TTS_VOICE_REPO, onnx_file),
+            config_path=hf_hub_download(TTS_VOICE_REPO, config_file),
+        )
+
     # ----- pre-warm -----
     @modal.method()
     def ping(self) -> str:
         return "pong"
+
+    # ----- text to speech -----
+    @modal.method()
+    def tts(self, text: str) -> bytes:
+        """Synthesize text to a complete WAV byte string (16-bit PCM)."""
+        text = (text or "").strip()
+        if not text:
+            return b""
+
+        chunks = list(self.tts.synthesize(text))
+        if not chunks:
+            return b""
+
+        first = chunks[0]
+        pcm = b"".join(chunk.audio_int16_bytes for chunk in chunks)
+        return _wav_bytes(pcm, first.sample_rate, first.sample_width, first.sample_channels)
 
     # ----- job worker -----
     @modal.method()

@@ -338,6 +338,44 @@ body.has-file .upload-label {
     letter-spacing: -0.01em;
 }
 
+.results-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.autoplay-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.9em;
+    font-weight: 600;
+    color: var(--ink-soft);
+    background: var(--surface-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 8px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.autoplay-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent-deep);
+}
+
+.autoplay-toggle input {
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.autoplay-toggle:has(input:checked) {
+    background: var(--accent-soft);
+    border-color: rgba(99, 102, 241, 0.4);
+    color: var(--accent-deep);
+}
+
 .download-btn {
     padding: 11px 20px;
     font-size: 0.95em;
@@ -425,6 +463,41 @@ body.has-file .upload-label {
     letter-spacing: 0.05em;
     opacity: 0.65;
     text-transform: uppercase;
+}
+
+.speak-btn {
+    position: absolute;
+    top: 10px;
+    left: 12px;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 2;
+    transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.speak-btn:hover {
+    background: rgba(255, 255, 255, 0.34);
+    transform: scale(1.08);
+}
+
+.speak-btn.playing {
+    background: rgba(255, 255, 255, 0.4);
+    animation: speak-pulse 1s ease-in-out infinite;
+}
+
+@keyframes speak-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.14); }
 }
 
 .flashcard-hint {
@@ -598,6 +671,11 @@ body.has-file .upload-label {
         text-align: center;
     }
 
+    .results-actions {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
     .password-prompt {
         padding: 28px 22px 22px;
     }
@@ -610,6 +688,9 @@ body.has-file .upload-label {
     .flashcard,
     .password-overlay,
     .password-prompt {
+        animation: none;
+    }
+    .speak-btn.playing {
         animation: none;
     }
     .flashcard-inner {
