@@ -4,9 +4,14 @@ document.addEventListener('DOMContentLoaded', function() {
     const passwordSubmit = document.getElementById('passwordSubmit');
     const passwordError = document.getElementById('passwordError');
     const fileInput = document.getElementById('fileInput');
+    const uploadLabel = document.querySelector('.upload-label');
+    const fileChip = document.getElementById('fileChip');
+    const fileChipName = document.getElementById('fileChipName');
+    const fileChipRemove = document.getElementById('fileChipRemove');
     const generateBtn = document.getElementById('generateBtn');
     const loading = document.getElementById('loading');
     const loadingText = document.getElementById('loadingText');
+    const progressBar = document.getElementById('progressBar');
     const cancelBtn = document.getElementById('cancelBtn');
     const results = document.getElementById('results');
     const error = document.getElementById('error');
@@ -82,7 +87,7 @@ document.addEventListener('DOMContentLoaded', function() {
         passwordInput.focus();
     }
 
-    /* ---------------- pre-warm (Layer 4) ---------------- */
+    /* ---------------- pre-warm ---------------- */
 
     function warmupNow() {
         if (!authToken) return;
@@ -102,16 +107,51 @@ document.addEventListener('DOMContentLoaded', function() {
 
     /* ---------------- file selection ---------------- */
 
-    fileInput.addEventListener('change', function(e) {
-        const file = e.target.files[0];
+    function setFile(file) {
         if (file) {
+            // Keep the hidden input in sync so the existing generate flow works.
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            fileInput.files = dt.files;
+
             generateBtn.disabled = false;
             generateBtn.textContent = `🧠 Generate from ${file.name}`;
+            fileChipName.textContent = `✅ ${file.name}`;
+            fileChip.classList.remove('hidden');
+            document.body.classList.add('has-file');
             warmupNow();
         } else {
+            fileInput.value = '';
             generateBtn.disabled = true;
             generateBtn.textContent = '🧠 Generate Flashcards';
+            fileChip.classList.add('hidden');
+            document.body.classList.remove('has-file');
         }
+    }
+
+    fileInput.addEventListener('change', function(e) {
+        setFile(e.target.files[0] || null);
+    });
+
+    fileChipRemove.addEventListener('click', function() {
+        setFile(null);
+    });
+
+    ['dragenter', 'dragover'].forEach(function(ev) {
+        uploadLabel.addEventListener(ev, function(e) {
+            e.preventDefault();
+            uploadLabel.classList.add('dragover');
+        });
+    });
+    ['dragleave', 'drop'].forEach(function(ev) {
+        uploadLabel.addEventListener(ev, function(e) {
+            e.preventDefault();
+            uploadLabel.classList.remove('dragover');
+        });
+    });
+    uploadLabel.addEventListener('drop', function(e) {
+        const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (file) setFile(file);
     });
 
     /* ---------------- generation flow ---------------- */
@@ -130,8 +170,9 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
 
-        clearJob();
+        stopPolling();
         showLoading('Uploading and extracting text…');
+        setProgress(-1);
 
         try {
             const base64File = await fileToBase64(file);
@@ -220,11 +261,20 @@ document.addEventListener('DOMContentLoaded', function() {
                 updateLoadingText('Queued…');
             } else if (data.status === 'processing') {
                 const progress = data.progress || '';
-                updateLoadingText(progress && progress !== '0/0'
-                    ? `Generating flashcards… (chunk ${progress.replace('/', ' of ')})`
-                    : 'Generating flashcards…');
+                const match = progress.match(/^(\d+)\/(\d+)$/);
+                if (progress && progress !== '0/0') {
+                    updateLoadingText(`Generating flashcards… (chunk ${progress.replace('/', ' of ')})`);
+                    if (match) {
+                        const done = parseInt(match[1], 10);
+                        const total = parseInt(match[2], 10);
+                        if (total > 0) setProgress(Math.round((done / total) * 100));
+                    }
+                } else {
+                    updateLoadingText('Generating flashcards…');
+                }
             } else if (data.status === 'complete') {
                 stopPolling();
+                setProgress(100);
                 currentFlashcards = data.cards || [];
                 showResults(currentFlashcards);
                 return;
@@ -258,10 +308,6 @@ document.addEventListener('DOMContentLoaded', function() {
         currentJobId = null;
     }
 
-    function clearJob() {
-        stopPolling();
-    }
-
     /* ---------------- rendering ---------------- */
 
     downloadBtn.addEventListener('click', function() {
@@ -285,6 +331,11 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    function setProgress(percent) {
+        progressBar.style.width = (percent < 0 ? 8 : percent) + '%';
+        progressBar.style.opacity = percent < 0 ? '0.45' : '1';
+    }
+
     function showLoading(text) {
         loading.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
@@ -306,6 +357,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function showResults(flashcards) {
         hideLoading();
+        setProgress(-1);
         results.classList.remove('hidden');
         error.classList.add('hidden');
 
@@ -320,6 +372,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function showError(message) {
         hideLoading();
+        setProgress(-1);
         results.classList.add('hidden');
         error.classList.remove('hidden');
         error.textContent = '❌ ' + message;
@@ -328,16 +381,19 @@ document.addEventListener('DOMContentLoaded', function() {
     function createFlashcardElement(card, number) {
         const flashcard = document.createElement('div');
         flashcard.className = 'flashcard';
+        flashcard.style.animationDelay = Math.min(index0(number), 500) + 'ms';
 
         flashcard.innerHTML = `
             <div class="flashcard-inner" onclick="this.classList.toggle('flip')">
                 <div class="flashcard-front">
                     <div class="flashcard-number">Q${number}</div>
                     <div>${escapeHtml(card.question)}</div>
+                    <div class="flashcard-hint">click to flip</div>
                 </div>
                 <div class="flashcard-back">
                     <div class="flashcard-number">A${number}</div>
                     <div>${escapeHtml(card.answer)}</div>
+                    <div class="flashcard-hint">click to flip back</div>
                 </div>
             </div>
         `;
@@ -345,9 +401,12 @@ document.addEventListener('DOMContentLoaded', function() {
         return flashcard;
     }
 
+    // Stagger card entrance animation without leaking `index` into helper scope
+    function index0(oneBased) { return (oneBased - 1) * 18; }
+
     function escapeHtml(text) {
         const div = document.createElement('div');
-        div.textContent = text;
+        div.textContent = text || '';
         return div.innerHTML.replace(/\n/g, '<br>');
     }
 });

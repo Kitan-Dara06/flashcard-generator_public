@@ -7,55 +7,72 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <div class="bg-glow" aria-hidden="true"></div>
+
     <div id="passwordOverlay" class="password-overlay">
-      <div class="password-prompt">
-            <h2>🔒 Enter Password</h2>
+        <div class="password-prompt">
+            <div class="password-icon">🔒</div>
+            <h2>Welcome back</h2>
+            <p class="password-subtitle">Enter the access password to continue</p>
             <input type="password" id="passwordInput" placeholder="Password" autocomplete="off" />
-            <button id="passwordSubmit">Submit</button>
+            <button id="passwordSubmit">Unlock app</button>
             <p id="passwordError" class="password-error hidden">❌ Incorrect password</p>
-      </div>
+        </div>
     </div>
+
     <div class="container">
         <header>
-            <h1>🎯 AI Flashcard Generator</h1>
-            <p>Upload a document and generate flashcards instantly!</p>
+            <span class="brand-chip">✦ AI-powered</span>
+            <h1>Flashcard Generator</h1>
+            <p>Drop in a lecture note, slide deck, or PDF — get a study deck in seconds.</p>
         </header>
-        
+
         <main>
             <div class="upload-section">
                 <div class="file-upload">
                     <input type="file" id="fileInput" accept=".pdf,.txt,.docx,.pptx" />
                     <label for="fileInput" class="upload-label">
-                        📤 Choose Document
-                        <span>PDF, TXT, DOCX, PPTX</span>
+                        <span class="upload-icon" aria-hidden="true">📄</span>
+                        <span class="upload-title">Drop your document here</span>
+                        <span class="upload-hint">or click to browse — PDF, TXT, DOCX, PPTX · max 3 MB</span>
                     </label>
+                    <div id="fileChip" class="file-chip hidden">
+                        <span id="fileChipName"></span>
+                        <button id="fileChipRemove" type="button" aria-label="Remove file">✕</button>
+                    </div>
                 </div>
-                
+
                 <button id="generateBtn" class="generate-btn" disabled>
                     🧠 Generate Flashcards
                 </button>
             </div>
-            
+
             <div id="loading" class="loading hidden">
                 <div class="spinner"></div>
-                <p id="loadingText">Generating flashcards...</p>
-                <button id="cancelBtn" class="cancel-btn hidden">✕ Cancel</button>
+                <p id="loadingText">Working…</p>
+                <div class="progress-track">
+                    <div id="progressBar" class="progress-bar"></div>
+                </div>
+                <button id="cancelBtn" class="cancel-btn">✕ Cancel</button>
             </div>
-            
+
             <div id="results" class="results hidden">
                 <div class="results-header">
                     <h2 id="resultsCount"></h2>
                     <button id="downloadBtn" class="download-btn">💾 Download JSON</button>
                 </div>
+                <p class="results-hint">Click a card to flip it. Questions on the front, answers on the back.</p>
                 <div id="flashcards" class="flashcard-container"></div>
             </div>
-            
+
             <div id="error" class="error hidden"></div>
         </main>
-  
-    
+
+        <footer class="app-footer">
+            <span>Deduplicated cards · Powered by Qwen 2.5 on Modal</span>
+        </footer>
+    </div>
+
     <script src="script.js"></script>
 </body>
-  
-</div>
 </html>
