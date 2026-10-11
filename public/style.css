@@ -125,6 +125,24 @@ header p {
     100% { transform: rotate(360deg); }
 }
 
+.cancel-btn {
+    background: white;
+    color: #4a6fa5;
+    border: 2px solid #4a6fa5;
+    padding: 10px 24px;
+    font-size: 0.95em;
+    font-weight: 600;
+    border-radius: 10px;
+    cursor: pointer;
+    margin-top: 10px;
+    transition: all 0.3s ease;
+}
+
+.cancel-btn:hover {
+    background: #4a6fa5;
+    color: white;
+}
+
 .results-header {
     display: flex;
     justify-content: space-between;
@@ -192,6 +210,65 @@ header p {
     right: 15px;
     font-size: 12px;
     opacity: 0.7;
+}
+
+.password-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1000;
+}
+
+.password-prompt {
+    background: white;
+    border-radius: 15px;
+    padding: 30px 40px;
+    width: 100%;
+    max-width: 360px;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    text-align: center;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+}
+
+.password-prompt input {
+    padding: 12px 15px;
+    font-size: 1rem;
+    border: 2px solid #d0d7e2;
+    border-radius: 8px;
+    outline: none;
+}
+
+.password-prompt input:focus {
+    border-color: #4a6fa5;
+}
+
+.password-prompt button {
+    background: linear-gradient(135deg, #4a6fa5 0%, #5cb85c 100%);
+    color: white;
+    border: none;
+    padding: 12px;
+    font-size: 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.password-error {
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+    padding: 8px;
+    border-radius: 8px;
+    font-size: 0.9em;
 }
 
 .hidden {

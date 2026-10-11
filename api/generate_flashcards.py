@@ -1,85 +1,92 @@
 # api/generate_flashcards.py
-import json
-import io
-import os
-import re
+# Async dispatcher: extracts text, stores the job in Redis, spawns the
+# Modal worker, and returns a job_id immediately.
 import base64
-from openai import OpenAI
-from typing import List
-import pdfplumber
+import hashlib
+import hmac
+import io
+import json
+import os
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler
 
-from pydantic import BaseModel, Field
-import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)  
-# ----- Pydantic models -----
-class Flashcard(BaseModel):
-    question: str = Field(description="The question on the flashcard")
-    answer: str = Field(description="The answer on the flashcard")
+import pdfplumber
 
-class FlashcardList(BaseModel):
-    flashcards: List[Flashcard] = Field(description="List of flashcards")
+MAX_PAGES = 100
+MAX_TEXT_CHARS = 500_000
+JOB_TTL_SECONDS = 24 * 60 * 60
+MODAL_APP_NAME = "flashcard-generator"
+MODAL_CLASS_NAME = "FlashcardLLM"
 
 
-# ----- JSON + Parsing Helpers -----
-def clean_json_output(text: str):
-    """Fix common JSON issues like trailing commas before parsing."""
-    return re.sub(r",(\s*[}\]])", r"\1", text)
+# ----- Auth -----
+def auth_secret():
+    """Secret used to sign auth tokens (falls back to APP_PASSWORD)."""
+    return os.environ.get("AUTH_SECRET") or os.environ.get("APP_PASSWORD", "")
 
-def safe_parse_flashcards(flashcards_list):
-    """Ensure flashcards always have 'question' and 'answer' fields."""
-    repaired = []
-    if hasattr(flashcards_list, "flashcards"): 
-         flashcards = flashcards_list.flashcards
-    elif isinstance(flashcards_list, dict): 
-         flashcards = flashcards_list.get("flashcards", [])
-    elif isinstance(flashcards_list, list):  # Already a list
-         flashcards = flashcards_list
-    else:
-        return []
 
-    for c in flashcards:
-        if isinstance(c, dict):
-            q = c.get("question", "").strip()
-            a = c.get("answer", "").strip() or "Answer not provided in text."
-        else:  # Pydantic model case
-            q = getattr(c, "question", "").strip()
-            a = getattr(c, "answer", "").strip() or "Answer not provided in text."
+def validate_auth_token(event):
+    """Validate the signed bearer token issued by /api/verify_password."""
+    secret = auth_secret()
+    if not secret:
+        return False
 
-        if q and a:
-             repaired.append({"question": q, "answer": a})
-    return repaired
+    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
+    auth = headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
 
-def parse_with_json_fallback(raw_output: str):
-    """Fallback: force JSON.loads."""
+    token = auth[len("bearer "):].strip()
+    expires_str, sep, signature = token.partition(".")
+    if not sep:
+        return False
+
     try:
-        cleaned = clean_json_output(raw_output)
-        data = json.loads(cleaned)
-        return safe_parse_flashcards(data)
-    except Exception as e:
-        print(f"⚠️ JSON fallback failed: {e}")
-        return []
+        if int(expires_str) < time.time():
+            return False
+    except ValueError:
+        return False
 
-def try_parse_flashcards(raw_output: str):
-    """Try Pydantic parsing first, then fallback to cleaned JSON."""
-    parser = PydanticOutputParser(pydantic_object=FlashcardList)
-    try:
-        cleaned = clean_json_output(raw_output)
-        parsed = parser.parse(cleaned)
-        if not getattr(parsed, "flashcards", None):
-            raise ValueError("Parsed object missing flashcards")
-        return safe_parse_flashcards(parsed)
-    except Exception as e:
-        print(f"⚠️ Parser failed, using JSON fallback: {e}")
-        return parse_with_json_fallback(raw_output)
+    expected = hmac.new(secret.encode(), expires_str.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
+# ----- CORS -----
+def resolve_cors_headers(event):
+    """CORS headers for origins listed in ALLOWED_ORIGINS only.
 
+    Same-origin requests don't need CORS headers, so leaving ALLOWED_ORIGINS
+    unset keeps the app working while blocking other sites from reading the API.
+    """
+    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
+    origin = headers.get("origin")
+    if not origin:
+        return {}
+    allowed = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    if origin in allowed:
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    return {}
+
+
+# ----- Redis + Modal -----
+def redis_client():
+    from upstash_redis import Redis
+    return Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+
+
+def dispatch_job(job_id: str):
+    """Fire-and-forget the Modal worker; returns immediately."""
+    import modal
+    cls = modal.Cls.from_name(MODAL_APP_NAME, MODAL_CLASS_NAME)
+    cls().process_job.spawn(job_id)
 
 
 # ----- Text extraction -----
-def extract_text_from_pdf(file_content, max_pages=100):
+def extract_text_from_pdf(file_content, max_pages=MAX_PAGES):
     try:
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
             total_pages = len(pdf.pages)
@@ -97,6 +104,7 @@ def extract_text_from_pdf(file_content, max_pages=100):
             "message": f"Error reading PDF: {str(e)}"
         }
 
+
 def extract_text_from_docx(file_content):
     try:
         from docx import Document
@@ -107,16 +115,8 @@ def extract_text_from_docx(file_content):
             "error": "docx_extraction_failed",
             "message": f"Error reading DOCX: {str(e)}"
         }
-def filter_valid_flashcards(flashcards):
-    valid = []
-    for item in flashcards:
-        if isinstance(item, dict):
-            q = item.get("question", "").strip()
-            a = item.get("answer", "").strip()
-            if q and a:
-                valid.append({"question": q, "answer": a})
-    return valid
-    
+
+
 def extract_text_from_pptx(file_content):
     try:
         from pptx import Presentation
@@ -134,104 +134,9 @@ def extract_text_from_pptx(file_content):
         }
 
 
-# ----- Flashcard generation -----
-
-def generate_flashcards(text, api_key):
-    client = OpenAI(api_key=api_key)
-    prompt_template =  """You are a flashcard generator for theory-based subjects.
-  Output a valid JSON object with a key "flashcards" containing a list of flashcards.
-Generate as many flashcards as possible (aim for at least 30 if content allows)
-Each flashcard must have:
-  - "question": a clear, concise question (string)
-  - "answer": a 2–3 sentence explanatory answer (string)
-Stay strictly factual, based only on the provided text.
-If the text contains no usable information, output {"flashcards": []}.
-Do not explain, apologize, or return any text outside the JSON object.
-
-Text:
-"""
-
-    CHARS_PER_TOKEN = 4  
-    MAX_INPUT_TOKENS = 6000
-    chunk_size = MAX_INPUT_TOKENS * CHARS_PER_TOKEN  
-    
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    all_flashcards = [] 
-    
-    for i, chunk in enumerate(chunks, 1):
-        if not chunk.strip():
-            continue
-            
-        try:
-            logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-            formatted_prompt =  prompt_template  + chunk
-            response = client.chat.completions.create(
-                model = "gpt-4o",
-                temperature = 0.3,
-                max_tokens = 4000,
-                response_format = {"type":"json_object"},
-                messages = [
-                {"role": "user", "content": formatted_prompt}
-                ]
-                )
-                                
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(json)?", "", raw)
-                raw = raw.replace("```", "").strip()
-            logger.info(f"Raw response from API: {raw[:500]}") 
-            
-            try:
-                data = json.loads(raw)
-            except:
-                logger.warning(f"Chunk {i}: JSON decode failed, trying fallback")
-                cleaned = re.sub(r",(\s*[}\]])", r"\1", raw) 
-                data = json.loads(cleaned)
-                
-            
-            logger.debug(f"Parsed JSON keys: {list(data.keys())}")
-            if "flashcards" not in data:
-                logger.warning(f"Chunk {i}: Response missing 'flashcards' key. Keys found: {list(data.keys())}")
-                continue
-            
-            flashcards_raw = data["flashcards"]
-            if not isinstance(flashcards_raw, list):
-                logger.warning(f"Chunk {i}: 'flashcards' is not a list, got {type(flashcards_raw)}")
-                continue
-            # if not filter_valid_flashcards(flashcards_raw):
-            #     logger.warning(f"Chunk {i}: Invalid flashcard structure")
-            #     continue
-            flashcards = safe_parse_flashcards(flashcards_raw)
-            if flashcards:  # Only add if we got valid flashcards
-                all_flashcards.extend(flashcards)
-                logger.info(f"Chunk {i}: Generated {len(flashcards)} flashcards")
-            else:
-                logger.warning(f"Chunk {i}: No valid flashcards generated")
-        except json.JSONDecodeError as e:
-            logger.error(f"Chunk {i}: JSON decode error - {e}")
-            logger.error(f"Raw response was: {raw[:500]}")
-            continue
-        except Exception as e:
-                logger.error(f"Chunk {i}: Unexpected error - {type(e).__name__}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                continue
-    return all_flashcards
-           
 # ----- Core handler logic -----
 def lambda_handler(event):
     try:
-        if event["httpMethod"] == "OPTIONS":
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type",
-                },
-                "body": ""
-            }
-
         if event["httpMethod"] != "POST":
             return {
                 "statusCode": 405,
@@ -239,16 +144,13 @@ def lambda_handler(event):
                 "body": json.dumps({"success": False, "error": "Method not allowed"})
             }
 
-        # Get OpenAI API key
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
+        if not validate_auth_token(event):
             return {
-                "statusCode": 500,
+                "statusCode": 401,
                 "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"success": False, "error": "OpenAI API key not configured"})
+                "body": json.dumps({"success": False, "error": "Unauthorized. Please enter the password again."})
             }
 
-        # Normalize headers (case-insensitive)
         headers = {k.lower(): v for k, v in event["headers"].items()}
         content_type = headers.get("content-type", "")
         if "application/json" not in content_type:
@@ -259,15 +161,29 @@ def lambda_handler(event):
             }
 
         # Parse JSON body
-        body = json.loads(event["body"])
-        file_content = base64.b64decode(body["file_content"])
-        file_type = body["file_type"]
+        try:
+            body = json.loads(event["body"])
+            file_content = base64.b64decode(body["file_content"])
+            file_type = body["file_type"]
+        except (KeyError, TypeError, ValueError):
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"success": False, "error": "Malformed request body"})
+            }
 
         # Extract text
         if file_type == "application/pdf":
             text = extract_text_from_pdf(file_content)
         elif file_type == "text/plain":
-            text = file_content.decode("utf-8")
+            try:
+                text = file_content.decode("utf-8")
+            except UnicodeDecodeError:
+                return {
+                    "statusCode": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"success": False, "error": "Text file must be UTF-8 encoded"})
+                }
         elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             text = extract_text_from_docx(file_content)
         elif file_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
@@ -278,12 +194,12 @@ def lambda_handler(event):
                 "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"success": False, "error": "Unsupported file type"})
             }
-        if isinstance(text, dict) and "error" in text:
+
+        if isinstance(text, dict):  # extraction helpers return an error dict on failure
             return {
-            "statusCode": 400,
-            "headers": { "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"},
-            "body": json.dumps({ "success": False, **text })
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"success": False, **text})
             }
 
         if not text.strip():
@@ -293,19 +209,43 @@ def lambda_handler(event):
                 "body": json.dumps({"success": False, "error": "Could not extract text from file"})
             }
 
-        # Generate flashcards
-        flashcards = generate_flashcards(text, api_key)
+        if len(text) > MAX_TEXT_CHARS:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "success": False,
+                    "error": "document_too_long",
+                    "message": f"Extracted text is too long ({len(text):,} chars). Limit: {MAX_TEXT_CHARS:,}. Try splitting the document."
+                })
+            }
+
+        # Queue the job
+        job_id = uuid.uuid4().hex
+        r = redis_client()
+        r.set(f"job:{job_id}:text", text, ex=JOB_TTL_SECONDS)
+        r.set(f"job:{job_id}:status", "queued", ex=JOB_TTL_SECONDS)
+        r.set(f"job:{job_id}:progress", "0/0", ex=JOB_TTL_SECONDS)
+
+        try:
+            dispatch_job(job_id)
+        except Exception as exc:
+            r.set(f"job:{job_id}:error", f"Dispatch failed: {exc}", ex=JOB_TTL_SECONDS)
+            r.set(f"job:{job_id}:status", "error", ex=JOB_TTL_SECONDS)
+            return {
+                "statusCode": 500,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "success": False,
+                    "error": "Could not start the AI worker. Please try again.",
+                    "details": str(exc)
+                })
+            }
+
         return {
             "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
-            },
-            "body": json.dumps({
-                "success": True,
-                "flashcards": flashcards,
-                "count": len(flashcards)
-            })
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"success": True, "job_id": job_id, "status": "queued"})
         }
 
     except Exception as e:
@@ -314,10 +254,7 @@ def lambda_handler(event):
         print(traceback.format_exc())
         return {
             "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
-            },
+            "headers": {"Content-Type": "application/json"},
             "body": json.dumps({
                 "success": False,
                 "error": str(e),
@@ -328,6 +265,13 @@ def lambda_handler(event):
 
 # ----- Vercel entrypoint -----
 class handler(BaseHTTPRequestHandler):
+    def _send(self, response):
+        self.send_response(response["statusCode"])
+        for k, v in response.get("headers", {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(response["body"].encode())
+
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8")
@@ -337,18 +281,13 @@ class handler(BaseHTTPRequestHandler):
             "body": body
         }
         response = lambda_handler(event)
-
-        self.send_response(response["statusCode"])
-        for k, v in response.get("headers", {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(response["body"].encode())
+        response.setdefault("headers", {}).update(resolve_cors_headers(event))
+        self._send(response)
 
     def do_OPTIONS(self):
-        response = lambda_handler({"httpMethod": "OPTIONS", "headers": {}, "body": ""})
-        self.send_response(response["statusCode"])
-        for k, v in response.get("headers", {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(response["body"].encode())
-
+        response_headers = {
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        }
+        response_headers.update(resolve_cors_headers({"headers": dict(self.headers)}))
+        self._send({"statusCode": 204, "headers": response_headers, "body": ""})
