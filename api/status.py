@@ -105,6 +105,13 @@ def lambda_handler(event):
             "status": status,
             "progress": r.get(f"job:{job_id}:progress") or "",
         }
+        if status in ("queued", "processing"):
+            # Lets the client tell "worker is slow" apart from "worker never started".
+            created = r.get(f"job:{job_id}:created")
+            try:
+                payload["age_seconds"] = max(0, int(time.time()) - int(created))
+            except (TypeError, ValueError):
+                payload["age_seconds"] = None
         if status == "complete":
             payload["cards"] = json.loads(r.get(f"job:{job_id}:cards") or "[]")
         elif status == "error":

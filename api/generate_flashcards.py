@@ -82,7 +82,17 @@ def dispatch_job(job_id: str):
     """Fire-and-forget the Modal worker; returns immediately."""
     import modal
     cls = modal.Cls.from_name(MODAL_APP_NAME, MODAL_CLASS_NAME)
-    cls().process_job.spawn(job_id)
+    try:
+        cls().process_job.spawn(job_id)
+    except modal.exception.NotFoundError as exc:
+        # The usual cause is MODAL_TOKEN_ID/SECRET belonging to a different
+        # workspace than the one this app was deployed to.
+        raise RuntimeError(
+            f"{exc}. Check that MODAL_TOKEN_ID/MODAL_TOKEN_SECRET belong to the "
+            f"workspace where you ran 'modal deploy {MODAL_APP_NAME}', that they are "
+            f"set for the Production environment, and that you redeployed afterwards "
+            f"(environment variables only take effect on new deployments)."
+        ) from exc
 
 
 # ----- Text extraction -----
@@ -226,6 +236,7 @@ def lambda_handler(event):
         r.set(f"job:{job_id}:text", text, ex=JOB_TTL_SECONDS)
         r.set(f"job:{job_id}:status", "queued", ex=JOB_TTL_SECONDS)
         r.set(f"job:{job_id}:progress", "0/0", ex=JOB_TTL_SECONDS)
+        r.set(f"job:{job_id}:created", str(int(time.time())), ex=JOB_TTL_SECONDS)
 
         try:
             dispatch_job(job_id)

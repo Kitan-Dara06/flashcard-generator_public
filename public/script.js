@@ -22,7 +22,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
     const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;   // base64 inflates ~33%; Vercel caps bodies at 4.5 MB
     const POLL_INTERVAL_MS = 2000;
-    const MAX_JOB_MS = 10 * 60 * 1000;
+    const MAX_JOB_MS = 20 * 60 * 1000;      // absolute ceiling (a big doc + cold start needs headroom)
+    const STALL_MS = 6 * 60 * 1000;         // give up if nothing changes for this long
     const WARMUP_COOLDOWN_MS = 60 * 1000;
 
     let authToken = sessionStorage.getItem('authToken');
@@ -35,6 +36,8 @@ document.addEventListener('DOMContentLoaded', function() {
     let pollTimer = null;
     let pollFailures = 0;
     let jobStartedAt = 0;
+    let lastActivityAt = 0;
+    let lastProgress = '';
     let lastWarmupAt = 0;
 
     /* ---------------- auth ---------------- */
@@ -204,6 +207,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
             currentJobId = data.job_id;
             jobStartedAt = Date.now();
+            lastActivityAt = Date.now();
+            lastProgress = '';
             pollFailures = 0;
             updateLoadingText('Queued…');
             schedulePoll(800);
@@ -241,7 +246,14 @@ document.addEventListener('DOMContentLoaded', function() {
         if (Date.now() - jobStartedAt > MAX_JOB_MS) {
             stopPolling();
             hideLoading();
-            showError('This is taking longer than expected. The job may still finish in the background.');
+            showError('This job is taking unusually long' + jobRef() + '. It may still finish in the background.');
+            return;
+        }
+        if (Date.now() - lastActivityAt > STALL_MS) {
+            stopPolling();
+            hideLoading();
+            showError('No progress for ' + Math.round(STALL_MS / 60000) + ' minutes' + jobRef() +
+                ' — the AI worker may have failed to start. Check the Modal logs.');
             return;
         }
 
@@ -264,10 +276,21 @@ document.addEventListener('DOMContentLoaded', function() {
             const data = await response.json();
 
             if (data.status === 'queued') {
-                updateLoadingText('Queued…');
+                const age = Number(data.age_seconds);
+                if (Number.isFinite(age) && age > 300) {
+                    updateLoadingText(`Still waiting for the AI worker to start… (${Math.floor(age / 60)} min). This usually means a cold start is unusually slow, or the worker is failing at boot.`);
+                } else if (Number.isFinite(age) && age > 45) {
+                    updateLoadingText(`Waiting for the AI worker to start… (cold start, ${age}s)`);
+                } else {
+                    updateLoadingText('Queued…');
+                }
             } else if (data.status === 'processing') {
                 const progress = data.progress || '';
                 const match = progress.match(/^(\d+)\/(\d+)$/);
+                if (progress !== lastProgress) {
+                    lastProgress = progress;
+                    lastActivityAt = Date.now();
+                }
                 if (progress && progress !== '0/0') {
                     updateLoadingText(`Generating flashcards… (chunk ${progress.replace('/', ' of ')})`);
                     if (match) {
@@ -476,6 +499,10 @@ document.addEventListener('DOMContentLoaded', function() {
     function setProgress(percent) {
         progressBar.style.width = (percent < 0 ? 8 : percent) + '%';
         progressBar.style.opacity = percent < 0 ? '0.45' : '1';
+    }
+
+    function jobRef() {
+        return currentJobId ? ` (job ${currentJobId.slice(0, 8)})` : '';
     }
 
     function showLoading(text) {
