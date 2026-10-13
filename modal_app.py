@@ -51,8 +51,13 @@ image = (
         "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
     )
     .pip_install(
+        # vLLM 0.6.6 pins torch==2.5.1 (and this project's guided-JSON decoding
+        # targets its API), so the transformer stack must stay on the same
+        # torch generation. Newer transformers calls torch.accelerator.* (torch
+        # >= 2.6) and breaks the import on torch 2.5.
         "vllm==0.6.6",
-        "sentence-transformers>=3.0.0",
+        "transformers==4.46.3",
+        "sentence-transformers==3.3.1",
         "piper-tts>=1.2.0",
         "upstash-redis>=1.0.0",
     )
@@ -131,7 +136,9 @@ def _wav_bytes(pcm: bytes, sample_rate: int, sample_width: int, channels: int) -
 class FlashcardLLM:
     @modal.enter(snap=True)
     def load(self):
-        """Load models once; Modal snapshots this state for ~1-3s restores."""
+        """Load the models generation depends on. Keep this lean: anything that
+        fails here takes the whole container down, so optional extras (TTS) are
+        loaded lazily on first use instead."""
         from sentence_transformers import SentenceTransformer
         from vllm import LLM
 
@@ -145,23 +152,37 @@ class FlashcardLLM:
         # bge-small runs on CPU: it's tiny, and keeps the GPU free for vLLM.
         self.embedder = SentenceTransformer(EMBED_MODEL)
 
-        # Piper TTS also runs on CPU, co-located so it shares the container
-        # (and therefore the warm/snapshot lifecycle) with the LLM.
-        from huggingface_hub import hf_hub_download
-        from piper.voice import PiperVoice
-
-        onnx_file, config_file = _voice_paths(TTS_VOICE)
-        self.tts = PiperVoice.load(
-            hf_hub_download(TTS_VOICE_REPO, onnx_file),
-            config_path=hf_hub_download(TTS_VOICE_REPO, config_file),
-        )
-
     # ----- pre-warm -----
     @modal.method()
     def ping(self) -> str:
         return "pong"
 
     # ----- text to speech -----
+    def _get_voice(self):
+        """Lazily load the Piper voice (CPU), once per container.
+
+        Deliberately not part of load(): TTS is optional and must never be able
+        to stop the container from booting. Raises only when TTS is actually
+        used, and the failure surfaces as a 502 from /api/tts.
+        """
+        voice = getattr(self, "_voice", None)
+        if voice is not None:
+            return voice
+
+        from huggingface_hub import hf_hub_download
+        try:
+            from piper.voice import PiperVoice          # piper-tts 1.2.x
+        except ImportError:
+            from piper import PiperVoice                # piper-tts 1.3.x+
+
+        onnx_file, config_file = _voice_paths(TTS_VOICE)
+        print(f"Loading Piper voice {TTS_VOICE} (first TTS request)")
+        self._voice = PiperVoice.load(
+            hf_hub_download(TTS_VOICE_REPO, onnx_file),
+            config_path=hf_hub_download(TTS_VOICE_REPO, config_file),
+        )
+        return self._voice
+
     @modal.method()
     def tts(self, text: str) -> bytes:
         """Synthesize text to a complete WAV byte string (16-bit PCM)."""
@@ -169,7 +190,7 @@ class FlashcardLLM:
         if not text:
             return b""
 
-        chunks = list(self.tts.synthesize(text))
+        chunks = list(self._get_voice().synthesize(text))
         if not chunks:
             return b""
 
@@ -328,3 +349,72 @@ def download_models() -> None:
     snapshot_download(QWEN_MODEL)
     snapshot_download(EMBED_MODEL)
     hf_cache.commit()
+
+
+@app.function(image=image, gpu="A10G", memory=32768, volumes={"/cache": hf_cache}, timeout=1200)
+def diagnose() -> None:
+    """Boot-step probe: reports how far container setup gets, stage by stage.
+
+    Deliberately a plain function (no class, no memory snapshot), so it isolates
+    "the image can't load the models" from "the class container can't boot".
+    Imports live inside each stage so one broken dependency can't hide the rest.
+
+    Run:  modal run modal_app.py::diagnose
+    """
+    import traceback
+
+    def stage(label, fn):
+        try:
+            result = fn()
+            print(f"[ok]   {label}")
+            return result
+        except Exception as exc:
+            print(f"[FAIL] {label}: {type(exc).__name__}: {exc}")
+            print(traceback.format_exc())
+            return None
+
+    def report_versions():
+        import importlib.metadata as md
+        for name in ("torch", "transformers", "sentence-transformers", "vllm", "piper-tts"):
+            try:
+                print(f"       {name} {md.version(name)}")
+            except Exception:
+                print(f"       {name} NOT INSTALLED")
+        return True
+
+    def load_vllm():
+        from vllm import LLM
+        return LLM(
+            QWEN_MODEL,
+            quantization="awq",
+            gpu_memory_utilization=0.85,
+            max_model_len=16384,
+            disable_log_stats=True,
+        )
+
+    def load_embedder():
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer(EMBED_MODEL)
+
+    def load_piper():
+        from huggingface_hub import hf_hub_download
+        try:
+            from piper.voice import PiperVoice        # piper-tts 1.2.x
+        except ImportError:
+            from piper import PiperVoice              # piper-tts 1.3.x+
+        onnx_file, config_file = _voice_paths(TTS_VOICE)
+        voice = PiperVoice.load(
+            hf_hub_download(TTS_VOICE_REPO, onnx_file),
+            config_path=hf_hub_download(TTS_VOICE_REPO, config_file),
+        )
+        return list(voice.synthesize("Diagnostics test."))
+
+    print("installed versions:")
+    stage("report installed versions", report_versions)
+    stage("import + load vLLM (Qwen 2.5 7B Instruct AWQ)", load_vllm)
+    stage("import + load bge-small embedder (sentence-transformers)", load_embedder)
+    chunks = stage("load Piper voice and synthesize a test phrase", load_piper)
+    if chunks:
+        pcm = sum(len(chunk.audio_int16_bytes) for chunk in chunks)
+        print(f"[ok]   piper returned {len(chunks)} chunk(s), {pcm} PCM bytes")
+    print("diagnose finished")

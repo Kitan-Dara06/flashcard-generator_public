@@ -29,6 +29,8 @@ Upload a PDF, TXT, DOCX, or PPTX and get an AI-generated deck of flashcards you 
 
 ## Setup
 
+> Python 3.12 is pinned in `.python-version` — Vercel's Python runtime requires >= 3.12, and without a pin the CLI falls back to a default that may not match.
+
 1. **Upstash**: create a Redis database (free tier is plenty) and note the REST URL + token.
 2. **Modal** (`pip install -U modal`, `modal token new`):
    ```bash
@@ -79,6 +81,30 @@ Each flashcard has a 🔊 button on both faces (plus an **Auto-read** toggle tha
 - **Caching**: `/api/tts` hashes `voice + text` and caches the WAV in Redis for 7 days, so re-studying a deck is free. The browser also keeps an in-memory cache for the session.
 - **Interruptions**: starting a new clip aborts in-flight requests and stops the current audio, so rapid clicks never queue up. Speech also stops when the tab is hidden or a new generation starts.
 - **Voice**: change `TTS_VOICE` in `modal_app.py` (and `api/tts.py`, which must match) to any voice from the `rhasspy/piper-voices` repo, then `modal deploy`. The new voice downloads into the volume on first use.
+
+## Full pipeline test
+
+`test_pipeline.py` drives the whole stack over HTTP exactly like the browser does — token → submit → poll → cards → TTS — using only the Python standard library:
+
+```bash
+modal deploy modal_app.py     # worker up to date first
+vercel dev                    # or point the script elsewhere with --base-url
+
+python3 test_pipeline.py "/path/to/report.docx"
+python3 test_pipeline.py report.docx --cancel-after 45   # also exercises the cancel path
+python3 test_pipeline.py report.docx --tts-sample 2      # synthesise audio for 2 cards
+python3 test_pipeline.py report.docx --base-url https://flashcard-generator-public.vercel.app
+```
+
+What it checks and reports:
+
+- **Timings**: cold/warm start (submit → worker started), per-chunk progress, generation time, total.
+- **Cards**: count, empty question/answer fields, exact-duplicate questions that survived dedup, answer length min/avg/max, plus a few samples.
+- **TTS**: validates the WAV header (rate/channels/duration) and confirms the Redis cache answers a repeat request faster.
+- **Cancel** (with `--cancel-after`): asserts the job reports `cancelled`.
+- **Failure modes**: a stalled worker, a 401, a 404, or a job `error` all exit non-zero with the server's message.
+
+Exit code is `0` only if the whole pipeline passed.
 
 ## Limits & tuning
 
