@@ -24,21 +24,35 @@ Upload a PDF, TXT, DOCX, or PPTX and get an AI-generated deck of flashcards you 
 | Qwen 2.5 **7B** AWQ | ~10 GB VRAM; restores on A10G in seconds, unlike a 14B model |
 | Modal volume + snapshot | Weights cached on Modal storage; `enable_memory_snapshot=True` + `@modal.enter(snap=True)` restore the loaded engine in ~1–3 s |
 | `scaledown_window=1200` | Stays warm 20 min after the last request (20 > 15 min cron gap on purpose, so pings always hit a warm container) |
-| Study-hours cron | `keep_warm` pings the container every 15 min, Mon–Fri 08:00–22:00 (`STUDY_TIMEZONE`), then lets it scale to zero overnight (~$0.10–0.20/day) |
+| Study-hours cron (**off by default**) | `keep_warm` *can* ping every 15 min Mon-Fri 08:00-22:00 (`STUDY_TIMEZONE`), but it ships disabled: with a 20-min `scaledown_window`, a 15-min ping keeps an A10G continuously warm for ~14 h per weekday - the same order as ~$300/month - which dwarfs the ~50 s cold starts it saves on a low-traffic app. Warm on demand instead: `modal run modal_app.py::keep_warm` |
 | Frontend pre-warm | `/api/warmup` fires on page load, tab focus, and file selection (60 s client cooldown), so the boot happens while the user is still choosing a file |
 
 ## Setup
 
 > Python 3.12 is pinned in `.python-version` — Vercel's Python runtime requires >= 3.12, and without a pin the CLI falls back to a default that may not match.
 
-1. **Upstash**: create a Redis database (free tier is plenty) and note the REST URL + token.
+1. **Upstash**: create a Redis database (free tier is plenty). The code accepts any of these, in order of precedence:
+   - `REDIS_URL` — native TLS string, e.g. `rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required`
+   - `UPSTASH_HOST` + `UPSTASH_PASSWORD` (+ optional `UPSTASH_PORT`, default `6379`) — the fields the Upstash dashboard shows; the code composes the URL
+   - `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` — the REST pair (no TCP; leanest for serverless)
+
+   **Use the same choice on both sides** (Vercel *and* the Modal secret) — the two client libraries encode values differently, so splitting them corrupts job state.
 2. **Modal** (`pip install -U modal`, `modal token new`):
    ```bash
-   # Both keys are required - the app reads the URL *and* the token:
+   # one value...
+   modal secret create --force upstash \
+     REDIS_URL="rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required"
+
+   # ...or the REST pair (both keys):
    modal secret create --force upstash \
      UPSTASH_REDIS_REST_URL=https://... \
      UPSTASH_REDIS_REST_TOKEN=...
+
    modal deploy modal_app.py
+   ```
+   Verify the worker can reach Redis without burning a full job:
+   ```bash
+   modal run modal_app.py::diagnose   # first stage checks the secret + does a Redis round trip
    ```
    `STUDY_TIMEZONE` in `modal_app.py` is set to `Africa/Lagos` (WAT, UTC+1) - change it if your audience shifts.
 
@@ -52,8 +66,10 @@ Upload a PDF, TXT, DOCX, or PPTX and get an AI-generated deck of flashcards you 
    | --- | --- | --- |
    | `APP_PASSWORD` | yes | Login gate password |
    | `AUTH_SECRET` | recommended | Token signing secret (falls back to `APP_PASSWORD`) |
-   | `UPSTASH_REDIS_REST_URL` | yes | Redis REST endpoint |
-   | `UPSTASH_REDIS_REST_TOKEN` | yes | Redis REST token |
+   | `REDIS_URL` | one of three | Native TLS URL, e.g. `rediss://default:...@host:port/0?ssl_cert_reqs=required` |
+   | `UPSTASH_HOST` + `UPSTASH_PASSWORD` (optional `UPSTASH_PORT`) | one of three | Composed into `REDIS_URL` automatically |
+   | `UPSTASH_REDIS_REST_URL` | one of three | Redis REST endpoint |
+   | `UPSTASH_REDIS_REST_TOKEN` | one of three | Redis REST token |
    | `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | yes | Allow Vercel to spawn Modal jobs |
    | `ALLOWED_ORIGINS` | no | Extra CORS origins, e.g. `http://localhost:3000` |
 

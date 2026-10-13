@@ -217,14 +217,15 @@ def main():
     first_processing = None
     chunk_times = []
     last_activity = time.time()
+    current_state = ""
     cancelled = False
 
     while True:
         elapsed = time.time() - t_submit
         if elapsed > MAX_POLL_SECONDS:
             fail(f"timed out after {elapsed:.0f}s (job {job_id[:8]} may still finish)")
-        if time.time() - last_activity > STALL_AFTER_SECONDS:
-            fail(f"no progress for {STALL_AFTER_SECONDS}s - the worker probably failed to start")
+        if current_state == "processing" and time.time() - last_activity > STALL_AFTER_SECONDS:
+            fail(f"generation stalled for {STALL_AFTER_SECONDS}s (job {job_id[:8]}) - check the Modal logs")
 
         if args.cancel_after and not cancelled and elapsed > args.cancel_after:
             c_status, c_body = request_json(f"{base}/api/cancel", token, payload={"job_id": job_id})
@@ -242,6 +243,7 @@ def main():
             continue
 
         state = data.get("status")
+        current_state = state or ""
         progress = data.get("progress") or ""
 
         if state == "queued":

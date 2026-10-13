@@ -23,7 +23,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;   // base64 inflates ~33%; Vercel caps bodies at 4.5 MB
     const POLL_INTERVAL_MS = 2000;
     const MAX_JOB_MS = 20 * 60 * 1000;      // absolute ceiling (a big doc + cold start needs headroom)
-    const STALL_MS = 6 * 60 * 1000;         // give up if nothing changes for this long
+    const STALL_MS = 6 * 60 * 1000;         // give up if *generation* stops progressing
+    const QUEUED_GRACE_MS = 12 * 60 * 1000; // a cold boot may legitimately stay queued a while
     const WARMUP_COOLDOWN_MS = 60 * 1000;
 
     let authToken = sessionStorage.getItem('authToken');
@@ -38,6 +39,7 @@ document.addEventListener('DOMContentLoaded', function() {
     let jobStartedAt = 0;
     let lastActivityAt = 0;
     let lastProgress = '';
+    let lastStatus = '';
     let lastWarmupAt = 0;
 
     /* ---------------- auth ---------------- */
@@ -85,6 +87,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function expireAuth() {
         stopPolling();
         stopSpeaking();
+        stopStudyPing();
         hideLoading();
         authToken = null;
         sessionStorage.removeItem('authToken');
@@ -108,11 +111,30 @@ document.addEventListener('DOMContentLoaded', function() {
     window.addEventListener('load', warmupNow);
     document.addEventListener('visibilitychange', function() {
         if (document.hidden) {
-            stopSpeaking();   // don't talk to an empty room
+            stopSpeaking();
         } else {
-            warmupNow();
+            warmupNow();   // also fires on back-to-foreground tabs
         }
     });
+
+    // Back-button / bfcache restore: the browser may have served a cached page
+    // while the Modal container decayed to zero in the background. Re-warm
+    // immediately so the next "Generate" click is instant.
+    window.addEventListener('pageshow', function(e) {
+        if (e.persisted) warmupNow();
+    });
+
+    // While the user is actively studying, ping the GPU every few minutes
+    // so the scaledown_window never expires. Stops automatically when they
+    // leave the results view. (Cooldown in warmupNow() prevents spam.)
+    let studyTimer = null;
+    function startStudyPing() {
+        stopStudyPing();
+        studyTimer = setInterval(warmupNow, 5 * 60 * 1000);
+    }
+    function stopStudyPing() {
+        if (studyTimer) { clearInterval(studyTimer); studyTimer = null; }
+    }
 
     /* ---------------- file selection ---------------- */
 
@@ -209,6 +231,7 @@ document.addEventListener('DOMContentLoaded', function() {
             jobStartedAt = Date.now();
             lastActivityAt = Date.now();
             lastProgress = '';
+            lastStatus = 'queued';
             pollFailures = 0;
             updateLoadingText('Queued…');
             schedulePoll(800);
@@ -249,11 +272,11 @@ document.addEventListener('DOMContentLoaded', function() {
             showError('This job is taking unusually long' + jobRef() + '. It may still finish in the background.');
             return;
         }
-        if (Date.now() - lastActivityAt > STALL_MS) {
+        if (lastStatus === 'processing' && Date.now() - lastActivityAt > STALL_MS) {
             stopPolling();
             hideLoading();
-            showError('No progress for ' + Math.round(STALL_MS / 60000) + ' minutes' + jobRef() +
-                ' — the AI worker may have failed to start. Check the Modal logs.');
+            showError('Generation stalled for ' + Math.round(STALL_MS / 60000) + ' minutes' + jobRef() +
+                ' — check the Modal logs.');
             return;
         }
 
@@ -274,6 +297,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
             pollFailures = 0;
             const data = await response.json();
+            lastStatus = data.status || '';
 
             if (data.status === 'queued') {
                 const age = Number(data.age_seconds);
@@ -283,6 +307,14 @@ document.addEventListener('DOMContentLoaded', function() {
                     updateLoadingText(`Waiting for the AI worker to start… (cold start, ${age}s)`);
                 } else {
                     updateLoadingText('Queued…');
+                }
+                const queuedSeconds = Number.isFinite(age) ? age : (Date.now() - jobStartedAt) / 1000;
+                if (queuedSeconds * 1000 > QUEUED_GRACE_MS) {
+                    stopPolling();
+                    hideLoading();
+                    showError('The AI worker never started' + jobRef() + ' (queued ' +
+                        Math.round(queuedSeconds / 60) + ' min). Check the Modal logs.');
+                    return;
                 }
             } else if (data.status === 'processing') {
                 const progress = data.progress || '';
@@ -507,6 +539,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function showLoading(text) {
         stopSpeaking();
+        stopStudyPing();
         loading.classList.remove('hidden');
         cancelBtn.classList.remove('hidden');
         results.classList.add('hidden');
@@ -539,6 +572,8 @@ document.addEventListener('DOMContentLoaded', function() {
             const flashcardEl = createFlashcardElement(card, index + 1);
             flashcardsContainer.appendChild(flashcardEl);
         });
+
+        startStudyPing();   // keep the GPU warm for the next generation
     }
 
     function showError(message) {

@@ -70,12 +70,47 @@ def resolve_cors_headers(event):
 
 
 # ----- Redis + Modal -----
+_REDIS_CLIENT = None
+
+
 def redis_client():
-    from upstash_redis import Redis
-    return Redis(
-        url=os.environ["UPSTASH_REDIS_REST_URL"],
-        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
-    )
+    """Redis client.
+
+    Credentials are resolved in this order:
+      1. REDIS_URL - a full connection string, e.g.
+         rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required
+      2. composed from UPSTASH_HOST + UPSTASH_PASSWORD (+ UPSTASH_PORT, default
+         6379) - the fields the Upstash dashboard shows
+      3. the Upstash REST pair (UPSTASH_REDIS_REST_URL + _TOKEN), which needs no
+         TCP connection and is the leanest option for serverless
+
+    Writers and readers must use the same transport (the clients encode values
+    differently), so keep both sides on the same choice.
+    """
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        host = os.environ.get("UPSTASH_HOST") or os.environ.get("UPSTASH_ENDPOINT")
+        password = os.environ.get("UPSTASH_PASSWORD")
+        if host and password:
+            from urllib.parse import quote
+            port = os.environ.get("UPSTASH_PORT") or "6379"
+            url = (f"rediss://default:{quote(password, safe='')}@{host}:{port}/0"
+                   f"?ssl_cert_reqs=required")
+
+    if url:
+        import redis
+        _REDIS_CLIENT = redis.from_url(url, decode_responses=True)
+    else:
+        from upstash_redis import Redis
+        _REDIS_CLIENT = Redis(
+            url=os.environ["UPSTASH_REDIS_REST_URL"],
+            token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+        )
+    return _REDIS_CLIENT
 
 
 def dispatch_job(job_id: str):

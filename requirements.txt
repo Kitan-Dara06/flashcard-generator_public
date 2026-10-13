@@ -3,4 +3,5 @@ python-dotenv>=1.0.0
 python-docx>=1.1.0
 python-pptx>=0.6.0
 upstash-redis>=1.0.0
+redis>=5.0.0
 modal>=0.67.0

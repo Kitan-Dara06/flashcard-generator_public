@@ -28,6 +28,8 @@ QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 MAX_CHUNK_CHARS = 24_000        # ~6k tokens per chunk
+MIN_CHUNK_CHARS = 6_000         # gather at least this much before honouring a topic break
+MAX_CHUNKS = 8                  # ceiling on LLM calls per document (raises min size if needed)
 SIM_BOUNDARY_THRESHOLD = 0.5    # adjacent-block similarity below this: topic boundary
 DEDUP_THRESHOLD = 0.92          # question similarity above this: duplicate card
 REDIS_TTL_SECONDS = 24 * 60 * 60
@@ -58,8 +60,15 @@ image = (
         "vllm==0.6.6",
         "transformers==4.46.3",
         "sentence-transformers==3.3.1",
+        # vLLM 0.6.6 declares xgrammar>=0.1.6 with NO upper bound, so pip pulls
+        # the 0.2.x line, whose TokenizerInfo API changed
+        # ("type object 'TokenizerInfo' has no attribute 'from_huggingface'")
+        # and breaks guided decoding. 0.1.6 is vLLM 0.6.6's declared minimum,
+        # so it is compatible with the calls vLLM makes.
+        "xgrammar==0.1.6",
         "piper-tts>=1.2.0",
         "upstash-redis>=1.0.0",
+        "redis>=5.0.0",
     )
     .env({"HF_HOME": "/cache"})
 )
@@ -92,6 +101,73 @@ def _flashcard_schema() -> dict:
 def _dot(a, b) -> float:
     """Dot product; embeddings are normalized, so this is cosine similarity."""
     return float(sum(x * y for x, y in zip(a, b)))
+
+
+def _redis_url() -> str | None:
+    """The Redis connection string, however it was supplied.
+
+    1. REDIS_URL directly, or
+    2. composed from the Upstash dashboard fields: UPSTASH_HOST (or
+       UPSTASH_ENDPOINT) + UPSTASH_PASSWORD (+ UPSTASH_PORT, default 6379).
+
+    Returns None when neither is available, in which case the caller uses the
+    Upstash REST API instead.
+    """
+    url = os.environ.get("REDIS_URL")
+    if url:
+        return url
+
+    host = os.environ.get("UPSTASH_HOST") or os.environ.get("UPSTASH_ENDPOINT")
+    password = os.environ.get("UPSTASH_PASSWORD")
+    if not (host and password):
+        return None
+
+    from urllib.parse import quote
+    port = os.environ.get("UPSTASH_PORT") or "6379"
+    return (f"rediss://default:{quote(password, safe='')}@{host}:{port}/0"
+            f"?ssl_cert_reqs=required")
+
+
+def _redis_client():
+    """Redis client for the worker - mirrors the helper in api/*.py.
+
+    Native TLS (redis-py) when a URL can be resolved, otherwise the Upstash REST
+    API (URL + token). Writers and readers must use the same transport - the
+    clients encode values differently - so keep both sides on the same choice.
+    """
+    url = _redis_url()
+    if url:
+        try:
+            import redis
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'redis' client package is required when connecting with a "
+                "rediss:// URL (pinned in requirements.txt and the Modal image). "
+                "Install it, or switch to the Upstash REST credentials instead."
+            ) from exc
+        return redis.from_url(url, decode_responses=True)
+
+    rest_url = os.environ["UPSTASH_REDIS_REST_URL"]
+    if not rest_url.startswith(("http://", "https://")):
+        raise RuntimeError(
+            f"UPSTASH_REDIS_REST_URL={rest_url!r} is missing its scheme - it should "
+            f"look like 'https://<host>.upstash.io'. If you meant to use the native "
+            f"connection instead, set REDIS_URL (rediss://...) or UPSTASH_HOST + "
+            f"UPSTASH_PASSWORD (+ UPSTASH_PORT)."
+        )
+
+    from upstash_redis import Redis
+    return Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+
+
+def _has_redis_credentials() -> bool:
+    if _redis_url():
+        return True
+    return bool(os.environ.get("UPSTASH_REDIS_REST_URL")
+                and os.environ.get("UPSTASH_REDIS_REST_TOKEN"))
 
 
 def _voice_paths(voice: str) -> tuple[str, str]:
@@ -144,7 +220,11 @@ class FlashcardLLM:
 
         self.llm = LLM(
             QWEN_MODEL,
-            quantization="awq",
+            # vLLM logs that this model can use awq_marlin and that plain awq
+            # "is not fully optimized yet. The speed can be slower" - marlin
+            # kernels are the faster path on Ampere+ (A10G). Revert to "awq"
+            # if it ever misbehaves.
+            quantization="awq_marlin",
             gpu_memory_utilization=0.85,
             max_model_len=16384,
             disable_log_stats=True,
@@ -201,12 +281,18 @@ class FlashcardLLM:
     # ----- job worker -----
     @modal.method()
     def process_job(self, job_id: str) -> None:
-        from upstash_redis import Redis
+        if not _has_redis_credentials():
+            # We cannot write to Redis without these, so this is the only place
+            # the problem can be reported - make it loud and actionable.
+            raise RuntimeError(
+                "No Redis credentials in the container environment. Set REDIS_URL "
+                "(rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required) "
+                "on the 'upstash' secret, or both UPSTASH_REDIS_REST_URL and "
+                "UPSTASH_REDIS_REST_TOKEN. Recreate it with: modal secret create "
+                "--force upstash REDIS_URL=..."
+            )
 
-        r = Redis(
-            url=os.environ["UPSTASH_REDIS_REST_URL"],
-            token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
-        )
+        r = _redis_client()
 
         def key(suffix: str) -> str:
             return f"job:{job_id}:{suffix}"
@@ -214,14 +300,15 @@ class FlashcardLLM:
         def write(suffix: str, value: str) -> None:
             r.set(key(suffix), value, ex=REDIS_TTL_SECONDS)
 
-        # Cheap fix for abandoned jobs: cancel flag is honoured before and
-        # between chunks, so a cancelled job releases the GPU almost instantly.
-        if r.get(key("cancelled")) == "1":
-            write("status", "cancelled")
-            return
-
-        write("status", "processing")
         try:
+            # Cheap fix for abandoned jobs: the cancel flag is honoured before
+            # and between chunks, so a cancelled job frees the GPU fast.
+            if r.get(key("cancelled")) == "1":
+                write("status", "cancelled")
+                return
+
+            write("status", "processing")
+
             text = r.get(key("text"))
             if not text:
                 raise ValueError("Job data expired or missing")
@@ -241,8 +328,12 @@ class FlashcardLLM:
             write("cards", json.dumps(cards))
             write("status", "complete")
         except Exception as exc:
-            write("error", f"{type(exc).__name__}: {exc}")
-            write("status", "error")
+            try:
+                write("error", f"{type(exc).__name__}: {exc}")
+                write("status", "error")
+            except Exception as nested:
+                # Redis itself is unusable; the Modal log is the only record.
+                print("could not record the failure in Redis:", nested)
             raise
 
     # ----- internals -----
@@ -275,10 +366,17 @@ class FlashcardLLM:
         chunks: list[str] = []
         current = [sized[0]]
         current_len = len(sized[0])
+        # Bound the number of LLM calls: for a long document, require more text
+        # per chunk so a report with many short sections can't turn into a
+        # dozen-plus generations.
+        min_chars = max(MIN_CHUNK_CHARS, len(text) // MAX_CHUNKS)
         for i in range(1, len(sized)):
             similarity = _dot(embeddings[i - 1], embeddings[i])
             block_len = len(sized[i])
-            if similarity < SIM_BOUNDARY_THRESHOLD or current_len + block_len + 2 > max_chars:
+            # Only honour a topic break once enough text has accumulated.
+            topic_break = (similarity < SIM_BOUNDARY_THRESHOLD
+                           and current_len >= min_chars)
+            if topic_break or current_len + block_len + 2 > max_chars:
                 chunks.append("\n\n".join(current))
                 current, current_len = [sized[i]], block_len
             else:
@@ -331,9 +429,20 @@ class FlashcardLLM:
         return [cards[i] for i in kept]
 
 
-@app.function(schedule=modal.Cron("*/15 8-22 * * 1-5", timezone=STUDY_TIMEZONE))
+# Layer 3 of the cold-start strategy is DISABLED by default.
+#
+# Why: a ping every 15 min with a 20-minute scaledown_window keeps the A10G
+# *continuously* warm for the whole study window - roughly 14 h per weekday,
+# which costs far more than the cold starts it avoids. For a low-traffic app
+# the frontend pre-warm hook (invoked when a user actually opens the page) is
+# the better trade: free when nobody is around.
+#
+# Warm the worker on demand instead:   modal run modal_app.py::keep_warm
+# Or re-enable the schedule by adding back:
+#   schedule=modal.Cron("*/15 8-22 * * 1-5", timezone=STUDY_TIMEZONE)
+@app.function()
 def keep_warm() -> None:
-    """Tiny call every 15 min during study hours; resets FlashcardLLM's idle timer."""
+    """Put the LLM container into a warm state without running a job."""
     FlashcardLLM().ping.remote()
 
 
@@ -351,13 +460,21 @@ def download_models() -> None:
     hf_cache.commit()
 
 
-@app.function(image=image, gpu="A10G", memory=32768, volumes={"/cache": hf_cache}, timeout=1200)
+@app.function(
+    image=image,
+    gpu="A10G",
+    memory=32768,
+    volumes={"/cache": hf_cache},
+    secrets=[redis_secret],   # the same secret the worker mounts, so we can verify it
+    timeout=1200,
+)
 def diagnose() -> None:
-    """Boot-step probe: reports how far container setup gets, stage by stage.
+    """Boot-step probe: checks the worker's environment, Redis access, and models.
 
     Deliberately a plain function (no class, no memory snapshot), so it isolates
     "the image can't load the models" from "the class container can't boot".
     Imports live inside each stage so one broken dependency can't hide the rest.
+    Never prints secret values - only which variables are present.
 
     Run:  modal run modal_app.py::diagnose
     """
@@ -373,6 +490,27 @@ def diagnose() -> None:
             print(traceback.format_exc())
             return None
 
+    def check_secret_and_redis():
+        expected = ("REDIS_URL", "UPSTASH_HOST", "UPSTASH_ENDPOINT", "UPSTASH_PORT",
+                    "UPSTASH_PASSWORD", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN")
+        present = [name for name in expected if os.environ.get(name)]
+        lengths = {name: len(os.environ[name]) for name in present}
+        print(f"       secret vars present: {present or 'none'} (lengths {lengths})")
+        print(f"       transport: {'native rediss:// (redis-py)' if _redis_url() else 'Upstash REST'}")
+
+        if not _has_redis_credentials():
+            raise RuntimeError(
+                "No Redis credentials in the container. Set ONE of: REDIS_URL "
+                "(rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required), "
+                "UPSTASH_HOST + UPSTASH_PASSWORD (+ optional UPSTASH_PORT), or both "
+                "UPSTASH_REDIS_REST_* keys. Recreate the secret, e.g. "
+                "modal secret create --force upstash REDIS_URL=..."
+            )
+
+        client = _redis_client()
+        client.set("diag:ping", "ok", ex=60)
+        return client.get("diag:ping")
+
     def report_versions():
         import importlib.metadata as md
         for name in ("torch", "transformers", "sentence-transformers", "vllm", "piper-tts"):
@@ -386,7 +524,7 @@ def diagnose() -> None:
         from vllm import LLM
         return LLM(
             QWEN_MODEL,
-            quantization="awq",
+            quantization="awq_marlin",
             gpu_memory_utilization=0.85,
             max_model_len=16384,
             disable_log_stats=True,
@@ -409,6 +547,10 @@ def diagnose() -> None:
         )
         return list(voice.synthesize("Diagnostics test."))
 
+    print("worker environment:")
+    if stage("read secret env vars + Redis round trip", check_secret_and_redis) is None:
+        print("stopping early - fix the secret above, then re-run")
+        return
     print("installed versions:")
     stage("report installed versions", report_versions)
     stage("import + load vLLM (Qwen 2.5 7B Instruct AWQ)", load_vllm)
