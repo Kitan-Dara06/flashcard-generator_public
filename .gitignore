@@ -3,3 +3,7 @@ __pycache__/
 .env*
 .vercel/
 .vercel
+
+# dev-only UI preview artifacts (never deployed)
+preview.html
+.preview/

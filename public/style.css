@@ -387,15 +387,26 @@ body.has-file .upload-label {
     margin-bottom: 22px;
 }
 
+.results-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.results-stats {
+    color: var(--ink-soft);
+    font-size: 0.88em;
+}
+
 .flashcard-container {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 20px;
 }
 
 .flashcard {
-    height: 210px;
-    perspective: 1000px;
+    height: 240px;
+    perspective: 1200px;
     animation: card-in 0.45s ease backwards;
 }
 
@@ -424,23 +435,19 @@ body.has-file .upload-label {
     transform: rotateY(180deg);
 }
 
-.flashcard-front,
-.flashcard-back {
+/* Each side is a header / scrollable body / footer column, so the difficulty
+   chip, audio button and card number can never overlap the text. */
+.flashcard-side {
     position: absolute;
-    width: 100%;
-    height: 100%;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 14px 16px 12px;
+    border-radius: var(--radius-md);
     backface-visibility: hidden;
     -webkit-backface-visibility: hidden;
-    border-radius: var(--radius-md);
-    padding: 22px 24px 34px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    font-size: 15.5px;
-    line-height: 1.55;
-    overflow-y: auto;
     box-shadow: var(--shadow-md);
+    overflow: hidden;
 }
 
 .flashcard-front {
@@ -448,38 +455,52 @@ body.has-file .upload-label {
     color: #fff;
 }
 
+/* Answer side: light paper look - long answers read far better as dark-on-light. */
 .flashcard-back {
-    background: linear-gradient(150deg, #047857 0%, #059669 100%);
-    color: #fff;
+    background: linear-gradient(180deg, #ffffff 0%, #f2fcf7 100%);
+    color: var(--ink);
+    border: 1px solid rgba(5, 150, 105, 0.22);
     transform: rotateY(180deg);
 }
 
-.flashcard-number {
+.flashcard-back::before {
+    content: '';
     position: absolute;
-    top: 12px;
-    right: 16px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    opacity: 0.65;
-    text-transform: uppercase;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #059669, #34d399);
 }
 
-/* difficulty chip + card number share the top-right corner */
-.flashcard-meta {
-    position: absolute;
-    top: 12px;
-    right: 14px;
+.card-top {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
-    gap: 8px;
-    z-index: 2;
+    gap: 10px;
+    padding-bottom: 8px;
 }
 
-.flashcard-meta .flashcard-number {
-    position: static;
-    top: auto;
-    right: auto;
+.card-tags {
+    flex: 1;
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+.card-number {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.7;
+}
+
+.flashcard-back .card-number {
+    color: var(--ink-faint, var(--ink-soft));
+    opacity: 1;
 }
 
 .difficulty-chip {
@@ -487,40 +508,99 @@ body.has-file .upload-label {
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    padding: 3px 8px;
+    padding: 3px 9px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.25);
     color: #fff;
-    opacity: 0.9;
 }
 
-.difficulty-chip.easy { background: rgba(16, 185, 129, 0.45); }
-.difficulty-chip.medium { background: rgba(245, 158, 11, 0.45); }
-.difficulty-chip.hard { background: rgba(239, 68, 68, 0.45); }
+.difficulty-chip.easy   { background: rgba(5, 150, 105, 0.55); }
+.difficulty-chip.medium { background: rgba(217, 119, 6, 0.55); }
+.difficulty-chip.hard   { background: rgba(225, 29, 72, 0.55); }
 
-/* the model's verbatim supporting sentence, shown on the answer side */
-.flashcard-body {
-    margin: auto;
-    width: 100%;
+/* The only scrollable area on a card; the header/footer rows stay put. */
+.card-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 4px;
+    scrollbar-width: thin;
 }
 
-.flashcard-body .source-quote {
-    margin: 12px auto 0;
-    padding-left: 10px;
-    border-left: 2px solid rgba(255, 255, 255, 0.45);
-    font-size: 0.78em;
-    font-style: italic;
-    line-height: 1.45;
-    opacity: 0.85;
+/* auto margins center the text when short and let it scroll fully when long
+   (justify-content: center clips the top of overflowing content) */
+.card-text {
+    margin: auto 0;
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.55;
+    text-align: center;
+}
+
+.flashcard-back .card-text {
+    font-weight: 500;
     text-align: left;
+    align-self: stretch;
+}
+
+.quote-toggle {
+    flex: 0 0 auto;
+    font-family: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #047857;
+    background: #ecfdf5;
+    border: 1px solid rgba(5, 150, 105, 0.35);
+    border-radius: 999px;
+    padding: 5px 12px;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.quote-toggle:hover {
+    background: #d1fae5;
+    border-color: #059669;
+}
+
+.source-quote {
+    display: none;
+    align-self: stretch;
+    text-align: left;
+    font-size: 0.82em;
+    font-style: italic;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    background: rgba(16, 185, 129, 0.08);
+    border-left: 3px solid #34d399;
+    border-radius: 6px;
+    padding: 8px 10px;
+    animation: fade-in 0.2s ease;
+}
+
+.flashcard-back.quote-open .source-quote {
+    display: block;
+}
+
+.card-foot {
+    flex: 0 0 auto;
+    padding-top: 8px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.55;
+    text-align: center;
 }
 
 .speak-btn {
-    position: absolute;
-    top: 10px;
-    left: 12px;
-    width: 32px;
-    height: 32px;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -528,11 +608,15 @@ body.has-file .upload-label {
     border-radius: 50%;
     background: rgba(255, 255, 255, 0.18);
     color: #fff;
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1;
     cursor: pointer;
-    z-index: 2;
     transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.flashcard-back .speak-btn {
+    background: rgba(15, 23, 42, 0.06);
+    color: var(--ink-soft);
 }
 
 .speak-btn:hover {
@@ -540,9 +624,17 @@ body.has-file .upload-label {
     transform: scale(1.08);
 }
 
+.flashcard-back .speak-btn:hover {
+    background: rgba(15, 23, 42, 0.12);
+}
+
 .speak-btn.playing {
     background: rgba(255, 255, 255, 0.4);
     animation: speak-pulse 1s ease-in-out infinite;
+}
+
+.flashcard-back .speak-btn.playing {
+    background: rgba(5, 150, 105, 0.18);
 }
 
 @keyframes speak-pulse {
@@ -550,16 +642,18 @@ body.has-file .upload-label {
     50% { transform: scale(1.14); }
 }
 
-.flashcard-hint {
-    position: absolute;
-    bottom: 10px;
-    left: 0;
-    right: 0;
-    font-size: 10.5px;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    opacity: 0.55;
-    pointer-events: none;
+/* thin, unobtrusive scrollbar inside cards (WebKit; Firefox uses scrollbar-width) */
+.card-body::-webkit-scrollbar {
+    width: 5px;
+}
+
+.card-body::-webkit-scrollbar-thumb {
+    background: rgba(100, 116, 139, 0.35);
+    border-radius: 999px;
+}
+
+.flashcard-back .card-body::-webkit-scrollbar-thumb {
+    background: rgba(5, 150, 105, 0.3);
 }
 
 /* ============================================================
@@ -713,6 +807,10 @@ body.has-file .upload-label {
 
     .flashcard-container {
         grid-template-columns: 1fr;
+    }
+
+    .flashcard {
+        height: 230px;
     }
 
     .results-header {

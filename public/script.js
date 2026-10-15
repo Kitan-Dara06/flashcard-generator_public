@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const error = document.getElementById('error');
     const flashcardsContainer = document.getElementById('flashcards');
     const resultsCount = document.getElementById('resultsCount');
+    const resultsStats = document.getElementById('resultsStats');
     const downloadBtn = document.getElementById('downloadBtn');
     const autoplayToggle = document.getElementById('autoplayToggle');
 
@@ -567,6 +568,18 @@ document.addEventListener('DOMContentLoaded', function() {
 
         resultsCount.textContent = `✅ Generated ${flashcards.length} flashcards!`;
 
+        // Deck summary: difficulty mix + how many cards carry a source quote.
+        const counts = { easy: 0, medium: 0, hard: 0 };
+        flashcards.forEach(function(c) {
+            const d = (c.difficulty || '').toLowerCase();
+            if (counts[d] !== undefined) counts[d]++;
+        });
+        const sourced = flashcards.filter(function(c) {
+            return (c.source_quote || '').trim();
+        }).length;
+        resultsStats.textContent =
+            `${counts.easy} easy · ${counts.medium} medium · ${counts.hard} hard · ${sourced}/${flashcards.length} sourced`;
+
         flashcardsContainer.innerHTML = '';
         flashcards.forEach((card, index) => {
             const flashcardEl = createFlashcardElement(card, index + 1);
@@ -593,28 +606,36 @@ document.addEventListener('DOMContentLoaded', function() {
         const rawDifficulty = (card.difficulty || '').toLowerCase();
         const difficulty = ['easy', 'medium', 'hard'].includes(rawDifficulty) ? rawDifficulty : '';
         const quote = (card.source_quote || '').trim();
-        const meta = `
-            <div class="flashcard-meta">
-                ${difficulty ? `<span class="difficulty-chip ${difficulty}">${difficulty}</span>` : ''}
-                <span class="flashcard-number">__SIDE__${number}</span>
-            </div>`;
+        const chip = difficulty
+            ? `<span class="difficulty-chip ${difficulty}">${difficulty}</span>`
+            : '';
 
         flashcard.innerHTML = `
             <div class="flashcard-inner">
-                <div class="flashcard-front">
-                    ${meta.replace('__SIDE__', 'Q')}
-                    <button class="speak-btn" type="button" title="Read aloud" aria-label="Read question aloud">🔊</button>
-                    <div class="flashcard-body"><div>${escapeHtml(card.question)}</div></div>
-                    <div class="flashcard-hint">click to flip</div>
-                </div>
-                <div class="flashcard-back">
-                    ${meta.replace('__SIDE__', 'A')}
-                    <button class="speak-btn" type="button" title="Read aloud" aria-label="Read answer aloud">🔊</button>
-                    <div class="flashcard-body">
-                        <div>${escapeHtml(card.answer)}</div>
-                        ${quote ? `<blockquote class="source-quote">📄 ${escapeHtml(quote)}</blockquote>` : ''}
+                <div class="flashcard-side flashcard-front">
+                    <div class="card-top">
+                        <button class="speak-btn" type="button" title="Read question aloud" aria-label="Read question aloud">🔊</button>
+                        <div class="card-tags">${chip}</div>
+                        <span class="card-number">Q${number}</span>
                     </div>
-                    <div class="flashcard-hint">click to flip back</div>
+                    <div class="card-body">
+                        <p class="card-text">${escapeHtml(card.question)}</p>
+                    </div>
+                    <div class="card-foot">tap to flip</div>
+                </div>
+                <div class="flashcard-side flashcard-back">
+                    <div class="card-top">
+                        <button class="speak-btn" type="button" title="Read answer aloud" aria-label="Read answer aloud">🔊</button>
+                        <div class="card-tags"></div>
+                        <span class="card-number">A${number}</span>
+                    </div>
+                    <div class="card-body">
+                        <p class="card-text">${escapeHtml(card.answer)}</p>
+                        ${quote ? `
+                        <button class="quote-toggle" type="button">📄 Show source</button>
+                        <blockquote class="source-quote">${escapeHtml(quote)}</blockquote>` : ''}
+                    </div>
+                    <div class="card-foot">tap to flip back</div>
                 </div>
             </div>
         `;
@@ -627,6 +648,16 @@ document.addEventListener('DOMContentLoaded', function() {
                 speakText(showingAnswer ? card.answer : card.question, null);
             }
         });
+
+        const quoteToggle = flashcard.querySelector('.quote-toggle');
+        if (quoteToggle) {
+            quoteToggle.addEventListener('click', function(e) {
+                e.stopPropagation();   // revealing the source should not flip the card away
+                const back = flashcard.querySelector('.flashcard-back');
+                const open = back.classList.toggle('quote-open');
+                quoteToggle.textContent = open ? '📄 Hide source' : '📄 Show source';
+            });
+        }
 
         flashcard.querySelector('.flashcard-front .speak-btn').addEventListener('click', function(e) {
             e.stopPropagation();

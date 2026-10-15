@@ -58,7 +58,10 @@
 
             <div id="results" class="results hidden">
                 <div class="results-header">
-                    <h2 id="resultsCount"></h2>
+                    <div class="results-heading">
+                        <h2 id="resultsCount"></h2>
+                        <p id="resultsStats" class="results-stats"></p>
+                    </div>
                     <div class="results-actions">
                         <label class="autoplay-toggle" title="Read each side aloud when you flip a card">
                             <input type="checkbox" id="autoplayToggle" />
@@ -67,7 +70,7 @@
                         <button id="downloadBtn" class="download-btn">💾 Download JSON</button>
                     </div>
                 </div>
-                <p class="results-hint">Click a card to flip it. Questions on the front, answers on the back.</p>
+                <p class="results-hint">Click a card to flip it · 🔊 reads a side aloud · "Show source" reveals the sentence the answer came from.</p>
                 <div id="flashcards" class="flashcard-container"></div>
             </div>
 
