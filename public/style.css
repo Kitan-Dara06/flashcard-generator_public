@@ -465,6 +465,56 @@ body.has-file .upload-label {
     text-transform: uppercase;
 }
 
+/* difficulty chip + card number share the top-right corner */
+.flashcard-meta {
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 2;
+}
+
+.flashcard-meta .flashcard-number {
+    position: static;
+    top: auto;
+    right: auto;
+}
+
+.difficulty-chip {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.2);
+    color: #fff;
+    opacity: 0.9;
+}
+
+.difficulty-chip.easy { background: rgba(16, 185, 129, 0.45); }
+.difficulty-chip.medium { background: rgba(245, 158, 11, 0.45); }
+.difficulty-chip.hard { background: rgba(239, 68, 68, 0.45); }
+
+/* the model's verbatim supporting sentence, shown on the answer side */
+.flashcard-body {
+    margin: auto;
+    width: 100%;
+}
+
+.flashcard-body .source-quote {
+    margin: 12px auto 0;
+    padding-left: 10px;
+    border-left: 2px solid rgba(255, 255, 255, 0.45);
+    font-size: 0.78em;
+    font-style: italic;
+    line-height: 1.45;
+    opacity: 0.85;
+    text-align: left;
+}
+
 .speak-btn {
     position: absolute;
     top: 10px;

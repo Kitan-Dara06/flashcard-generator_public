@@ -284,10 +284,22 @@ def main():
 
     log("cards", f"{len(cards)} cards, {duplicates} exact duplicates, {empty} empty fields")
     log("cards", f"answer length min/avg/max: {min(answers)}/{sum(answers) // len(answers)}/{max(answers)} chars")
+
+    quoted = sum(1 for c in cards if (c.get("source_quote") or "").strip())
+    difficulty_mix = {}
+    for card in cards:
+        key = (card.get("difficulty") or "?").lower()
+        difficulty_mix[key] = difficulty_mix.get(key, 0) + 1
+    log("cards", f"source quotes: {quoted}/{len(cards)}; difficulty: {difficulty_mix}")
+    if quoted < len(cards):
+        log("warn", f"{len(cards) - quoted} ungrounded card(s) survived the worker filter - investigate")
+
     print("\n  sample cards:")
     for card in cards[:3]:
         print(f"    Q: {card['question'][:100]}")
         print(f"    A: {card['answer'][:120]}...")
+        if card.get("source_quote"):
+            print(f"    📄 {card['source_quote'][:120]}...")
 
     if empty:
         fail(f"{empty} card(s) have empty question/answer")

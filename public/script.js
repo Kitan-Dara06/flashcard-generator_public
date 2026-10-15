@@ -590,18 +590,30 @@ document.addEventListener('DOMContentLoaded', function() {
         flashcard.className = 'flashcard';
         flashcard.style.animationDelay = Math.min((number - 1) * 18, 500) + 'ms';
 
+        const rawDifficulty = (card.difficulty || '').toLowerCase();
+        const difficulty = ['easy', 'medium', 'hard'].includes(rawDifficulty) ? rawDifficulty : '';
+        const quote = (card.source_quote || '').trim();
+        const meta = `
+            <div class="flashcard-meta">
+                ${difficulty ? `<span class="difficulty-chip ${difficulty}">${difficulty}</span>` : ''}
+                <span class="flashcard-number">__SIDE__${number}</span>
+            </div>`;
+
         flashcard.innerHTML = `
             <div class="flashcard-inner">
                 <div class="flashcard-front">
-                    <div class="flashcard-number">Q${number}</div>
+                    ${meta.replace('__SIDE__', 'Q')}
                     <button class="speak-btn" type="button" title="Read aloud" aria-label="Read question aloud">🔊</button>
-                    <div>${escapeHtml(card.question)}</div>
+                    <div class="flashcard-body"><div>${escapeHtml(card.question)}</div></div>
                     <div class="flashcard-hint">click to flip</div>
                 </div>
                 <div class="flashcard-back">
-                    <div class="flashcard-number">A${number}</div>
+                    ${meta.replace('__SIDE__', 'A')}
                     <button class="speak-btn" type="button" title="Read aloud" aria-label="Read answer aloud">🔊</button>
-                    <div>${escapeHtml(card.answer)}</div>
+                    <div class="flashcard-body">
+                        <div>${escapeHtml(card.answer)}</div>
+                        ${quote ? `<blockquote class="source-quote">📄 ${escapeHtml(quote)}</blockquote>` : ''}
+                    </div>
                     <div class="flashcard-hint">click to flip back</div>
                 </div>
             </div>

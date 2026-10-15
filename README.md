@@ -98,6 +98,16 @@ Each flashcard has a 🔊 button on both faces (plus an **Auto-read** toggle tha
 - **Interruptions**: starting a new clip aborts in-flight requests and stops the current audio, so rapid clicks never queue up. Speech also stops when the tab is hidden or a new generation starts.
 - **Voice**: change `TTS_VOICE` in `modal_app.py` (and `api/tts.py`, which must match) to any voice from the `rhasspy/piper-voices` repo, then `modal deploy`. The new voice downloads into the volume on first use.
 
+## Grounding (anti-hallucination)
+
+A 7B model leaks its own training knowledge into answers — "SIWES was established in 1973 by the ITF" can be correct *and* absent from your document. Two cheap countermeasures are built in:
+
+1. **Prompt**: the system prompt declares the text as the model's *only* source of truth and forbids inventing dates, names, numbers, or concepts.
+2. **Required `source_quote`**: the guided-JSON schema makes the model emit the verbatim sentence each answer is grounded in, so it has to *find* support rather than *recall* it. Cards also carry a `difficulty` rating (`easy` / `medium` / `hard`).
+3. **Ungrounded cards are dropped**: any card without a `source_quote` is discarded by the worker (counted in the Modal log, per chunk). A chunk whose text supports nothing simply contributes nothing — so expect a slightly smaller deck than an ungrounded run, and check `chunk i/N: K card(s)` lines if a topic comes up empty.
+
+The UI shows difficulty as a chip on both faces and the quote on the answer side. A second verification pass would tighten grounding further but doubles cost and latency — deliberately skipped.
+
 ## Full pipeline test
 
 `test_pipeline.py` drives the whole stack over HTTP exactly like the browser does — token → submit → poll → cards → TTS — using only the Python standard library:

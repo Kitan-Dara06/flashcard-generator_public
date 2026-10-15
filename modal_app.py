@@ -22,6 +22,9 @@ import struct
 import modal
 
 APP_NAME = "flashcard-generator"
+# Bumped whenever worker behaviour changes; printed at container boot so logs can
+# be matched against the deployed source (deploys are otherwise indistinguishable).
+BUILD = "grounding-v1"
 STUDY_TIMEZONE = "Africa/Lagos"  # <-- set to your users' timezone (Lagos = WAT, UTC+1)
 
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
@@ -38,13 +41,13 @@ REDIS_TTL_SECONDS = 24 * 60 * 60
 TTS_VOICE_REPO = "rhasspy/piper-voices"
 TTS_VOICE = "en_US-lessac-medium"   # <-- change to any rhasspy/piper-voices voice
 
-SYSTEM_PROMPT = """You are a flashcard generator for theory-based subjects.
-Generate as many flashcards as possible from the user's text (aim for at least 30 if the content allows).
-Each flashcard must have:
-- "question": a clear, concise question
-- "answer": a 2-3 sentence explanatory answer
-Stay strictly factual, based only on the provided text.
-If the text contains no usable information, return an empty list of flashcards."""
+SYSTEM_PROMPT = """You are a flashcard generator with no world knowledge. Treat the text below as your ONLY source of truth.
+
+For every flashcard you generate, you MUST include the source_quote field: the exact, verbatim sentence or phrase from the text that proves the answer is correct.
+You may rephrase the text for fluency and readability in the question and answer fields, but you MUST NOT invent any dates, names, numbers, or concepts not explicitly present in the source_quote.
+If the text contains no usable information, return an empty list of flashcards.
+Generate as many flashcards as the text supports (aim for at least 30 when there is enough material), and rate each card's difficulty as easy, medium, or hard.
+Do not explain, apologise, or return any text outside the JSON object."""
 
 app = modal.App(APP_NAME)
 
@@ -78,7 +81,12 @@ redis_secret = modal.Secret.from_name("upstash")
 
 
 def _flashcard_schema() -> dict:
-    """JSON schema for vLLM's guided decoder, so output is always valid JSON."""
+    """JSON schema for vLLM's guided decoder, so output is always valid JSON.
+
+    source_quote is required: making the model *find* a supporting sentence is
+    what keeps a small model from leaking its own training knowledge into the
+    cards (and it gives the UI something to show for trust).
+    """
     return {
         "type": "object",
         "properties": {
@@ -89,8 +97,10 @@ def _flashcard_schema() -> dict:
                     "properties": {
                         "question": {"type": "string"},
                         "answer": {"type": "string"},
+                        "source_quote": {"type": "string"},
+                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
                     },
-                    "required": ["question", "answer"],
+                    "required": ["question", "answer", "source_quote", "difficulty"],
                 },
             }
         },
@@ -218,6 +228,8 @@ class FlashcardLLM:
         from sentence_transformers import SentenceTransformer
         from vllm import LLM
 
+        print(f"[flashcard-worker] build={BUILD} booting")
+
         self.llm = LLM(
             QWEN_MODEL,
             # vLLM logs that this model can use awq_marlin and that plain awq
@@ -321,10 +333,23 @@ class FlashcardLLM:
                 if r.get(key("cancelled")) == "1":
                     write("status", "cancelled")
                     return
-                cards.extend(self._generate_cards(chunk))
+                batch = self._generate_cards(chunk)
+                # Per-chunk count: makes a chunk that yielded nothing (all cards
+                # dropped as ungrounded) visible in the log.
+                print(f"chunk {i}/{len(chunks)}: {len(batch)} card(s)")
+                cards.extend(batch)
                 write("progress", f"{i}/{len(chunks)}")
 
             cards = self._dedup(cards)
+            if cards:
+                # Shape check: catches any drift between what the model returns,
+                # what the filter keeps, and what the UI expects to render.
+                first = cards[0]
+                quoted = sum(1 for c in cards if (c.get("source_quote") or "").strip())
+                print(
+                    f"writing {len(cards)} card(s) to redis; "
+                    f"keys={sorted(first.keys())} grounded={quoted}/{len(cards)}"
+                )
             write("cards", json.dumps(cards))
             write("status", "complete")
         except Exception as exc:
@@ -402,11 +427,29 @@ class FlashcardLLM:
 
         data = json.loads(outputs[0].outputs[0].text)
         cards = []
+        dropped_ungrounded = 0
         for item in data.get("flashcards", []):
             question = str(item.get("question", "")).strip()
             answer = str(item.get("answer", "")).strip()
-            if question and answer:
-                cards.append({"question": question, "answer": answer})
+            quote = str(item.get("source_quote", "")).strip()
+            difficulty = str(item.get("difficulty", "")).strip().lower()
+            if difficulty not in ("easy", "medium", "hard"):
+                difficulty = "medium"
+            if not (question and answer):
+                continue
+            if not quote:
+                # Ungrounded: the model asserted something it cannot point at in
+                # the source text. Dropped rather than shipped.
+                dropped_ungrounded += 1
+                continue
+            cards.append({
+                "question": question,
+                "answer": answer,
+                "source_quote": quote,
+                "difficulty": difficulty,
+            })
+        if dropped_ungrounded:
+            print(f"dropped {dropped_ungrounded} ungrounded card(s) (no source_quote)")
         return cards
 
     def _dedup(self, cards: list[dict]) -> list[dict]:
