@@ -24,7 +24,7 @@ import modal
 APP_NAME = "flashcard-generator"
 # Bumped whenever worker behaviour changes; printed at container boot so logs can
 # be matched against the deployed source (deploys are otherwise indistinguishable).
-BUILD = "grounding-v1"
+BUILD = "grounding-v2"
 STUDY_TIMEZONE = "Africa/Lagos"  # <-- set to your users' timezone (Lagos = WAT, UTC+1)
 
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
@@ -46,7 +46,8 @@ SYSTEM_PROMPT = """You are a flashcard generator with no world knowledge. Treat 
 For every flashcard you generate, you MUST include the source_quote field: the exact, verbatim sentence or phrase from the text that proves the answer is correct.
 You may rephrase the text for fluency and readability in the question and answer fields, but you MUST NOT invent any dates, names, numbers, or concepts not explicitly present in the source_quote.
 If the text contains no usable information, return an empty list of flashcards.
-Generate as many flashcards as the text supports (aim for at least 30 when there is enough material), and rate each card's difficulty as easy, medium, or hard.
+Produce between 15 and 40 flashcards, depending on how much the text supports - quality over quantity, and never pad the list with restatements of the same fact.
+Rate each card's difficulty as easy, medium, or hard.
 Do not explain, apologise, or return any text outside the JSON object."""
 
 app = modal.App(APP_NAME)
@@ -106,6 +107,41 @@ def _flashcard_schema() -> dict:
         },
         "required": ["flashcards"],
     }
+
+
+def _parse_cards(raw: str) -> tuple[list[dict], bool]:
+    """Extract the card list from the model's response, salvaging a truncated one.
+
+    Guided decoding guarantees valid JSON *unless* the response is cut off by
+    max_tokens mid-string, which leaves an unterminated string and makes
+    json.loads raise. Rather than lose the whole chunk, walk the array and keep
+    every complete card object before the cut-off point.
+
+    Returns (cards, truncated).
+    """
+    try:
+        return list(json.loads(raw).get("flashcards") or []), False
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    pos = raw.find("[")
+    if pos < 0:
+        return [], True
+    pos += 1
+    cards: list[dict] = []
+    while True:
+        brace = raw.find("{", pos)
+        if brace < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, brace)
+        except json.JSONDecodeError:
+            break        # this is the card the token limit cut in half
+        if isinstance(obj, dict):
+            cards.append(obj)
+        pos = end
+    return cards, True
 
 
 def _dot(a, b) -> float:
@@ -329,16 +365,30 @@ class FlashcardLLM:
             write("progress", f"0/{len(chunks)}")
 
             cards: list[dict] = []
+            failed_chunks = 0
             for i, chunk in enumerate(chunks, 1):
                 if r.get(key("cancelled")) == "1":
                     write("status", "cancelled")
                     return
-                batch = self._generate_cards(chunk)
+                try:
+                    batch = self._generate_cards(chunk)
+                except Exception as exc:
+                    # One bad chunk must not sink the whole document: log it, score
+                    # it as empty, and keep going.
+                    failed_chunks += 1
+                    print(f"chunk {i}/{len(chunks)} failed: {type(exc).__name__}: {exc}")
+                    batch = []
                 # Per-chunk count: makes a chunk that yielded nothing (all cards
                 # dropped as ungrounded) visible in the log.
                 print(f"chunk {i}/{len(chunks)}: {len(batch)} card(s)")
                 cards.extend(batch)
                 write("progress", f"{i}/{len(chunks)}")
+
+            if not cards:
+                raise ValueError(
+                    f"No flashcards could be generated from this document "
+                    f"({failed_chunks}/{len(chunks)} chunk(s) failed)."
+                )
 
             cards = self._dedup(cards)
             if cards:
@@ -416,7 +466,10 @@ class FlashcardLLM:
 
         sampling = SamplingParams(
             temperature=0.1,
-            max_tokens=4000,
+            # Headroom: a 40-card response with question+answer+quote+difficulty is
+            # ~3.5-4k tokens. At 4000 the response was cut off mid-string, which
+            # (despite guided decoding) yields unparseable JSON.
+            max_tokens=7000,
             guided_decoding=GuidedDecodingParams(json=_flashcard_schema()),
         )
         messages = [
@@ -425,10 +478,15 @@ class FlashcardLLM:
         ]
         outputs = self.llm.chat(messages, sampling, use_tqdm=False)
 
-        data = json.loads(outputs[0].outputs[0].text)
+        items, truncated = _parse_cards(outputs[0].outputs[0].text)
+        if truncated:
+            print(f"response hit the token limit - salvaged {len(items)} card(s)")
+
         cards = []
         dropped_ungrounded = 0
-        for item in data.get("flashcards", []):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             question = str(item.get("question", "")).strip()
             answer = str(item.get("answer", "")).strip()
             quote = str(item.get("source_quote", "")).strip()

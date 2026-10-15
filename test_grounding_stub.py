@@ -1,7 +1,10 @@
-"""Stub test for the grounding drop rule in FlashcardLLM._generate_cards.
+"""Stub tests for the worker's card parsing.
 
-Fakes the vLLM imports so we can feed a canned model response and assert that
-cards missing `source_quote` are dropped. No GPU, no network.
+Covers two failures seen in production:
+  * cards that arrive without a `source_quote` must be dropped (grounding)
+  * a response cut off by max_tokens must still yield its complete cards
+
+Fakes the vLLM imports so there is no GPU and no network.
 
 Run:  python3 test_grounding_stub.py
 """
@@ -44,6 +47,46 @@ def _install_vllm_stubs(response_json: dict):
 
     sys.modules["vllm"] = vllm
     sys.modules["vllm.sampling_params"] = vllm_sp
+
+
+def test_parse_cards() -> bool:
+    import modal_app
+
+    ok = True
+
+    # 1. Well-formed response parses normally.
+    good = json.dumps({"flashcards": [
+        {"question": "q1", "answer": "a1", "source_quote": "s1", "difficulty": "easy"},
+        {"question": "q2", "answer": "a2", "source_quote": "s2", "difficulty": "hard"},
+    ]})
+    cards, truncated = modal_app._parse_cards(good)
+    if truncated or len(cards) != 2:
+        print(f"FAIL: valid JSON should parse cleanly, got {cards} truncated={truncated}")
+        ok = False
+
+    # 2. Response cut off mid-string (the production JSONDecodeError): the two
+    #    complete cards survive, the half-written third one is discarded.
+    cut = good[:-25]   # slice inside the last card's strings
+    cards, truncated = modal_app._parse_cards(cut)
+    if not truncated:
+        print("FAIL: truncated response was not flagged")
+        ok = False
+    if len(cards) != 1:
+        print(f"FAIL: expected 1 salvaged card, got {len(cards)}: {cards}")
+        ok = False
+    if cards and cards[0].get("source_quote") != "s1":
+        print(f"FAIL: salvaged the wrong card: {cards}")
+        ok = False
+
+    # 3. Nothing usable at all.
+    cards, truncated = modal_app._parse_cards("totally not json")
+    if cards != [] or not truncated:
+        print(f"FAIL: garbage input should salvage nothing, got {cards}")
+        ok = False
+
+    if ok:
+        print("PASS: _parse_cards handles valid, truncated and garbage output")
+    return ok
 
 
 def main() -> int:
@@ -98,7 +141,7 @@ def main() -> int:
     if ok:
         print(f"PASS: kept {len(cards)}/4 cards, dropped 2 ungrounded; "
               f"difficulty default works")
-    return 0 if ok else 1
+    return 0 if (ok and test_parse_cards()) else 1
 
 
 if __name__ == "__main__":
