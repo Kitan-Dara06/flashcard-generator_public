@@ -130,6 +130,450 @@ def dispatch_job(job_id: str):
         ) from exc
 
 
+# ----- Fallback engine (Gemini, called from Vercel) -----
+#
+# Why this runs here and not in Modal: it exists for "the Modal worker is not
+# available" - out of credit, bad token, GPU class refusing to boot. Anything
+# hosted in Modal dies together with Modal, so the fallback has to live outside
+# it.
+#
+# Trade-off: a Vercel function is bounded (60 s on Hobby, 300 s on Pro), so this
+# path refuses documents above GEMINI_MAX_CHARS and stops itself at
+# GEMINI_TIME_BUDGET rather than being killed mid-answer.
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MAX_CHARS = int(os.environ.get("GEMINI_MAX_CHARS", "120000"))
+GEMINI_CHUNK_CHARS = 60_000
+GEMINI_TIME_BUDGET = float(os.environ.get("GEMINI_TIME_BUDGET_SECONDS", "240"))
+
+# Keep in sync with SYSTEM_PROMPT in modal_app.py (they are separate deploy
+# targets, so the text is duplicated rather than imported).
+SYSTEM_PROMPT = """You are a flashcard generator with no world knowledge. Treat the text below as your ONLY source of truth.
+
+Rules you must never break:
+1. Never add background, definitions, examples, or context from your own knowledge - even if you are certain it is correct. If the text does not state it, it does not exist.
+2. If the text does not explicitly answer a question, do not write that card at all. There is no partial credit for a plausible guess.
+3. Every factual claim in the answer must be supported by the source_quote. If the answer needs a fact the quote lacks, remove the fact rather than supplying it yourself.
+4. The source_quote MUST be copied character-for-character from the text. Do not paraphrase it, summarise it, fix its spelling, or join sentences from different places.
+5. You must include source_quote on every card, plus a difficulty of easy, medium or hard.
+
+Produce between 15 and 40 flashcards depending on how much the text supports - quality over quantity, and never pad the list with restatements of the same fact.
+If the text contains no usable information, return an empty list of flashcards.
+Do not explain, apologise, or return any text outside the JSON object."""
+
+
+def flashcard_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "flashcards": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "source_quote": {"type": "string"},
+                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+                    },
+                    "required": ["question", "answer", "source_quote", "difficulty"],
+                },
+            }
+        },
+        "required": ["flashcards"],
+    }
+
+
+def norm(text):
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def quote_is_grounded(quote, chunk_norm, threshold=0.85):
+    """Is this quote really in the source text?
+
+    An invented quote is the tell for parametric leakage: a plausible sentence
+    attributed to a document that never said it.
+    """
+    quote_norm = norm(quote)
+    if len(quote_norm) < 12:
+        return False
+    if quote_norm in chunk_norm:
+        return True
+    quote_words = quote_norm.split()
+    if not quote_words:
+        return False
+    chunk_words = set(chunk_norm.split())
+    coverage = sum(1 for w in quote_words if w in chunk_words) / len(quote_words)
+    return coverage >= threshold
+
+
+def answer_numbers_grounded(answer, chunk_norm):
+    """Every number in the answer must appear in the source text."""
+    import re
+    for token in re.findall(r"\d[\d.,]*", answer):
+        token = token.rstrip(".,")
+        if token and token not in chunk_norm:
+            return False
+    return True
+
+
+# Words too common to say anything about whether the answer is supported.
+STOPWORDS = frozenset("""
+about above after again also although among any are because been before being
+below between both but can could did does doing down during each either few for
+from further had has have having here how into its itself just more most much
+not now off once only other our out over own same she should some such than that
+the their them then there these they this those through too under until very was
+were what when where which while who whom why will with would you your
+""".split())
+
+# How much of an answer's vocabulary must appear in its own source_quote.
+# Deliberately low: audit_cards.py shows real answers cluster around 0.9, so a high
+# cut-off drops healthy cards. This is a floor for gross mismatch only.
+ANSWER_QUOTE_MIN_COVERAGE = float(os.environ.get("ANSWER_QUOTE_MIN_COVERAGE", "0.50"))
+
+
+def capitalized_tokens(text):
+    """Capitalised words that are not merely capitalised for sentence position."""
+    import re
+    for match in re.finditer(r"[A-Za-z][A-Za-z'’\-]*", text or ""):
+        word = match.group(0)
+        if not word[0].isupper():
+            continue
+        before = (text[:match.start()] or "").rstrip()
+        if not before or before[-1] in ".:;!?-\n(\"“'":
+            continue      # sentence-initial or list item: not evidence
+        yield word
+
+
+def ungrounded_names(answer, quote):
+    """Names in the answer that its own quote never mentions.
+
+    ADVISORY ONLY - this is reported, never used to drop a card.
+
+    Capitalisation is a proxy for "named entity" at best: it misfires on
+    abbreviations, adjectives derived from names ("Nigerian" vs "Nigeria"),
+    and sentences the model starts mid-string. Dropping cards on it silently
+    shrinks the deck, so the real grounding gates remain the verbatim-quote
+    check and the number check.
+    """
+    quote_norm = norm(quote)
+    quote_words = set(content_words(quote))
+    missing = []
+    for word in capitalized_tokens(answer):
+        lower = word.lower()
+        if len(lower) < 3 or lower in STOPWORDS:
+            continue
+        if lower in quote_norm:
+            continue
+        # "Nigerian" should count as covered by "Nigeria".
+        if len(lower) >= 5 and any(w.startswith(lower[:5]) for w in quote_words
+                                   if len(w) >= 5):
+            continue
+        missing.append(word)
+    return missing
+
+
+def content_words(text):
+    import re
+    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in STOPWORDS]
+
+
+def answer_coverage(answer, quote):
+    """Fraction of the answer's content words that its own quote contains.
+
+    Catches the remaining leak: a quote that is genuinely in the document, but
+    an answer that quietly adds claims the quote never made.
+    """
+    answer_words = content_words(answer)
+    if not answer_words:
+        return 1.0
+    quote_words = set(content_words(quote))
+    if not quote_words:
+        return 0.0
+    return sum(1 for w in answer_words if w in quote_words) / len(answer_words)
+
+
+def clean_cards(items, chunk=""):
+    """Normalise cards and drop anything not grounded in `chunk`. Mirrors
+    _clean_cards in modal_app.py so both engines enforce the same rule."""
+    chunk_norm = norm(chunk) if chunk else ""
+    cards = []
+    dropped_ungrounded = 0
+    dropped_leaky = 0
+    dropped_drifted = 0
+    flagged_names = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        quote = str(item.get("source_quote", "")).strip()
+        difficulty = str(item.get("difficulty", "")).strip().lower()
+        if difficulty not in ("easy", "medium", "hard"):
+            difficulty = "medium"
+        if not (question and answer):
+            continue
+        if not quote:
+            dropped_ungrounded += 1
+            continue
+        if chunk_norm and not quote_is_grounded(quote, chunk_norm):
+            dropped_leaky += 1
+            continue
+        if chunk_norm and not answer_numbers_grounded(answer, chunk_norm):
+            dropped_leaky += 1
+            continue
+        if chunk_norm:
+            # Reported, never enforced - see ungrounded_names().
+            names = ungrounded_names(answer, quote)
+            if names:
+                flagged_names += 1
+                if flagged_names <= 5:
+                    print(f"  advisory: name(s) not in this card's quote: {names[:4]}")
+        # Short answers cannot drift far; only judge once there is enough of an
+        # answer to be worth judging.
+        if len(content_words(answer)) > 6 and answer_coverage(answer, quote) < ANSWER_QUOTE_MIN_COVERAGE:
+            dropped_drifted += 1
+            continue
+        cards.append({
+            "question": question,
+            "answer": answer,
+            "source_quote": quote,
+            "difficulty": difficulty,
+        })
+    if dropped_ungrounded:
+        print(f"dropped {dropped_ungrounded} card(s) with no source_quote")
+    if dropped_leaky:
+        print(f"dropped {dropped_leaky} card(s) whose quote/numbers are not in the source")
+    if dropped_drifted:
+        print(f"dropped {dropped_drifted} card(s) whose answer drifts beyond its quote")
+    if flagged_names:
+        print(f"advisory: {flagged_names} card(s) mention a name absent from their quote "
+              f"(kept - review manually)")
+    return cards, dropped_ungrounded + dropped_leaky + dropped_drifted
+
+
+def parse_cards(raw):
+    """Parse the model's JSON, salvaging complete cards from a truncated reply."""
+    import re
+    try:
+        return list(json.loads(raw).get("flashcards") or [])
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    decoder = json.JSONDecoder()
+    pos = raw.find("[")
+    if pos < 0:
+        return []
+    pos += 1
+    cards = []
+    while True:
+        brace = raw.find("{", pos)
+        if brace < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, brace)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            cards.append(obj)
+        pos = end
+    return cards
+
+
+def paragraph_chunks(text, max_chars=GEMINI_CHUNK_CHARS, max_chunks=6):
+    """Split on paragraph boundaries into at most max_chunks pieces.
+
+    The char budget is raised when capping at max_chunks would otherwise force a
+    chunk over it: with Gemini's wide window, fewer/larger chunks are cheaper and
+    faster than many small calls, so max_chunks wins and max_chars is the floor.
+    """
+    import re
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if not blocks:
+        return []
+
+    budget = max(max_chars, (len(text) + max_chunks - 1) // max_chunks)
+
+    sized = []
+    for block in blocks:
+        while len(block) > budget:
+            cut = block.rfind(" ", 0, budget)
+            cut = cut if cut > budget // 2 else budget
+            sized.append(block[:cut])
+            block = block[cut:].strip()
+        if block:
+            sized.append(block)
+
+    chunks = []
+    current = []
+    current_len = 0
+    for block in sized:
+        block_len = len(block)
+        if current and current_len + block_len + 2 > budget:
+            chunks.append("\n\n".join(current))
+            current, current_len = [block], block_len
+        else:
+            current.append(block)
+            current_len += block_len + 2
+    if current:
+        chunks.append("\n\n".join(current))
+
+    # Pathological input (thousands of tiny paragraphs) can still exceed the cap;
+    # fold neighbours together rather than dropping text.
+    while len(chunks) > max_chunks:
+        merged = []
+        for i in range(0, len(chunks), 2):
+            merged.append("\n\n".join(chunks[i:i + 2]))
+        chunks = merged
+    return chunks
+
+
+def text_dedup(cards, threshold=0.75, answer_threshold=0.85):
+    """Drop near-duplicate cards.
+
+    Two cards are duplicates if their questions are near-identical, or if their
+    answers are: a document that repeats one fact gets asked about it from
+    several angles, and question-only matching misses those.
+    """
+    import re
+    if len(cards) <= 1:
+        return cards
+
+    def words(text):
+        return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 2}
+
+    kept = []
+    kept_q = []
+    kept_a = []
+    for card in cards:
+        q = words(card["question"])
+        a = words(card.get("answer", ""))
+        if any(q and other and len(q & other) / len(q | other) >= threshold
+               for other in kept_q):
+            continue
+        if any(a and other and len(a & other) / len(a | other) >= answer_threshold
+               for other in kept_a):
+            continue
+        kept.append(card)
+        kept_q.append(q)
+        kept_a.append(a)
+    dropped = len(cards) - len(kept)
+    if dropped:
+        print(f"dedup: dropped {dropped} near-duplicate card(s)")
+    return kept
+
+
+def gemini_generate_cards(text, on_progress=None):
+    """Generate grounded cards with Gemini. Blocking; bounded by the time budget."""
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Add it to the Vercel project's Production "
+            "environment variables and redeploy."
+        )
+
+    client = genai.Client(api_key=api_key)
+    chunks = paragraph_chunks(text)
+    started = time.time()
+    cards = []
+
+    for i, chunk in enumerate(chunks, 1):
+        if time.time() - started > GEMINI_TIME_BUDGET:
+            print(f"stopping at chunk {i}/{len(chunks)}: time budget reached")
+            break
+
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            # Native structured output: the API enforces the schema, so
+            # source_quote is always present (it can still be empty or invented,
+            # which is exactly what clean_cards catches).
+            response_mime_type="application/json",
+            response_schema=flashcard_schema(),
+            temperature=0.1,
+            max_output_tokens=8192,
+            # "Thinking" is a latency and cost multiplier that buys nothing for
+            # extraction from a provided document.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=chunk, config=config)
+        except Exception as exc:
+            # Not every model/API version accepts thinking_budget=0. Retry once
+            # without it rather than failing the whole document.
+            if "thinking" not in str(exc).lower():
+                raise
+            print(f"thinking_config rejected ({exc}); retrying without it")
+            config = types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=flashcard_schema(),
+                temperature=0.1,
+                max_output_tokens=8192,
+            )
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=chunk, config=config)
+
+        items = parse_cards(getattr(response, "text", "") or "")
+        batch, dropped = clean_cards(items, chunk)
+        print(f"chunk {i}/{len(chunks)}: {len(batch)} card(s), dropped {dropped}")
+        cards.extend(batch)
+        if on_progress:
+            on_progress(i, len(chunks))
+
+    if not cards:
+        raise ValueError("Gemini returned no grounded cards for this document")
+    return text_dedup(cards)
+
+
+def run_gemini_job(job_id, r, text):
+    """Run the fallback for job_id and return an HTTP response dict."""
+    empty = {"Content-Type": "application/json"}
+
+    if len(text) > GEMINI_MAX_CHARS:
+        message = (
+            f"This document is too long for the backup engine "
+            f"({len(text):,} chars, limit {GEMINI_MAX_CHARS:,}). The AI worker is "
+            f"unavailable, so try again later or split the document."
+        )
+        r.set(f"job:{job_id}:error", message, ex=JOB_TTL_SECONDS)
+        r.set(f"job:{job_id}:status", "error", ex=JOB_TTL_SECONDS)
+        return {"statusCode": 503, "headers": empty,
+                "body": json.dumps({"success": False, "error": message})}
+
+    r.set(f"job:{job_id}:status", "processing", ex=JOB_TTL_SECONDS)
+    r.set(f"job:{job_id}:provider", "gemini", ex=JOB_TTL_SECONDS)
+    r.set(f"job:{job_id}:progress", "0/0", ex=JOB_TTL_SECONDS)
+
+    def on_progress(done, total):
+        r.set(f"job:{job_id}:progress", f"{done}/{total}", ex=JOB_TTL_SECONDS)
+
+    try:
+        cards = gemini_generate_cards(text, on_progress)
+    except Exception as exc:
+        import traceback
+        print("Gemini fallback failed:", repr(exc))
+        print(traceback.format_exc())
+        r.set(f"job:{job_id}:error", f"[gemini/{GEMINI_MODEL}] {type(exc).__name__}: {exc}",
+              ex=JOB_TTL_SECONDS)
+        r.set(f"job:{job_id}:status", "error", ex=JOB_TTL_SECONDS)
+        return {"statusCode": 502, "headers": empty,
+                "body": json.dumps({"success": False,
+                                    "error": "The backup engine also failed. " + str(exc)})}
+
+    r.set(f"job:{job_id}:cards", json.dumps(cards), ex=JOB_TTL_SECONDS)
+    r.set(f"job:{job_id}:status", "complete", ex=JOB_TTL_SECONDS)
+    return {"statusCode": 200, "headers": empty,
+            "body": json.dumps({"success": True, "job_id": job_id,
+                                "status": "complete", "provider": "gemini",
+                                "cards": len(cards)})}
+
+
 # ----- Text extraction -----
 def extract_text_from_pdf(file_content, max_pages=MAX_PAGES):
     try:
@@ -208,6 +652,38 @@ def lambda_handler(event):
         # Parse JSON body
         try:
             body = json.loads(event["body"])
+        except (TypeError, ValueError):
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"success": False, "error": "Malformed request body"})
+            }
+
+        # Re-run an existing job on the fallback engine. The frontend calls this
+        # when /api/status reports a stalled job, so it carries no file.
+        if body.get("job_id"):
+            job_id = str(body["job_id"])
+            r = redis_client()
+            if r.get(f"job:{job_id}:status") == "complete":
+                # Already finished (perhaps by the GPU worker while the client
+                # was deciding); never regenerate and overwrite good cards.
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"success": True, "job_id": job_id,
+                                        "status": "complete", "provider": "existing"})
+                }
+            text = r.get(f"job:{job_id}:text")
+            if not text:
+                return {
+                    "statusCode": 404,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"success": False,
+                                        "error": "Job not found or expired"})
+                }
+            return run_gemini_job(job_id, r, text)
+
+        try:
             file_content = base64.b64decode(body["file_content"])
             file_type = body["file_type"]
         except (KeyError, TypeError, ValueError):
@@ -273,24 +749,24 @@ def lambda_handler(event):
         r.set(f"job:{job_id}:progress", "0/0", ex=JOB_TTL_SECONDS)
         r.set(f"job:{job_id}:created", str(int(time.time())), ex=JOB_TTL_SECONDS)
 
+        # Explicit override, e.g. "provider": "gemini" to exercise the fallback.
+        requested = str(body.get("provider") or "").lower()
+
+        if requested == "gemini":
+            return run_gemini_job(job_id, r, text)
+
         try:
             dispatch_job(job_id)
         except Exception as exc:
-            import traceback
-            print("Dispatch to Modal failed:", repr(exc))
-            print(traceback.format_exc())
-            r.set(f"job:{job_id}:error", f"Dispatch failed: {exc}", ex=JOB_TTL_SECONDS)
-            r.set(f"job:{job_id}:status", "error", ex=JOB_TTL_SECONDS)
-            return {
-                "statusCode": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({
-                    "success": False,
-                    "error": "Could not start the AI worker. Please try again.",
-                    "details": str(exc)
-                })
-            }
+            # The GPU worker could not be reached at all (out of credit, bad
+            # token, wrong workspace, app undeployed). Run the fallback here.
+            print("Dispatch to Modal GPU worker failed:", repr(exc))
+            response = run_gemini_job(job_id, r, text)
+            if response["statusCode"] != 200:
+                print("Fallback engine also failed for job", job_id)
+            return response
 
+        r.set(f"job:{job_id}:provider", "qwen", ex=JOB_TTL_SECONDS)
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json"},

@@ -18,6 +18,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const flashcardsContainer = document.getElementById('flashcards');
     const resultsCount = document.getElementById('resultsCount');
     const resultsStats = document.getElementById('resultsStats');
+    const reviewToggle = document.getElementById('reviewToggle');
+    const dueCount = document.getElementById('dueCount');
     const downloadBtn = document.getElementById('downloadBtn');
     const autoplayToggle = document.getElementById('autoplayToggle');
 
@@ -42,6 +44,59 @@ document.addEventListener('DOMContentLoaded', function() {
     let lastProgress = '';
     let lastStatus = '';
     let lastWarmupAt = 0;
+    let fallbackTried = false;      // one auto-retry on the backup engine per job
+
+    // Leitner state lives in localStorage: { [questionHash]: { box, due, seen } }.
+    // No backend, no Redis, no auth - it survives reloads on this device only.
+    const LEITNER_KEY = 'leitner:v1';
+    let leitnerState = loadLeitnerState();
+    let reviewMode = false;
+
+    function loadLeitnerState() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(LEITNER_KEY) || '{}');
+            return parsed && typeof parsed === 'object' ? parsed : {};
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function saveLeitnerState() {
+        try {
+            localStorage.setItem(LEITNER_KEY, JSON.stringify(leitnerState));
+        } catch (e) { /* private mode / quota: scheduling just won't persist */ }
+    }
+
+    function entryFor(card) {
+        return leitnerState[Leitner.hashKey(card.question)];
+    }
+
+    function boxFor(card) {
+        const entry = entryFor(card);
+        return entry && entry.box ? entry.box : Leitner.initialBox(card.difficulty);
+    }
+
+    function dueCards(cards) {
+        const now = Date.now();
+        return cards.filter(function(card) { return Leitner.isDue(entryFor(card), now); });
+    }
+
+    function shuffled(list) {
+        const out = list.slice();
+        for (let i = out.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [out[i], out[j]] = [out[j], out[i]];
+        }
+        return out;
+    }
+
+    function gradeCard(card, gotIt) {
+        const key = Leitner.hashKey(card.question);
+        const seeded = { box: boxFor(card), seen: 0 };
+        leitnerState[key] = Leitner.grade(leitnerState[key] || seeded, gotIt, Date.now());
+        saveLeitnerState();
+        renderCurrentView();
+    }
 
     /* ---------------- auth ---------------- */
 
@@ -233,6 +288,7 @@ document.addEventListener('DOMContentLoaded', function() {
             lastActivityAt = Date.now();
             lastProgress = '';
             lastStatus = 'queued';
+            fallbackTried = false;
             pollFailures = 0;
             updateLoadingText('Queued…');
             schedulePoll(800);
@@ -299,6 +355,42 @@ document.addEventListener('DOMContentLoaded', function() {
             pollFailures = 0;
             const data = await response.json();
             lastStatus = data.status || '';
+
+            // The server saw the job sit in "queued" past its patience. Retry it
+            // once on the Gemini backup engine, which runs in Vercel and so still
+            // works when Modal itself is the broken part.
+            if (data.stalled && !fallbackTried) {
+                fallbackTried = true;
+                updateLoadingText('The AI worker is unavailable — switching to the backup engine…');
+                setProgress(-1);
+                try {
+                    const fb = await fetch('/api/generate_flashcards', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + authToken
+                        },
+                        body: JSON.stringify({ job_id: currentJobId, provider: 'gemini' })
+                    });
+                    if (fb.status === 401) { expireAuth(); return; }
+                    const fbData = await fb.json().catch(function() { return {}; });
+                    if (fb.ok && fbData.success) {
+                        // Cards are already in Redis; the next poll renders them.
+                        lastActivityAt = Date.now();
+                        schedulePoll(500);
+                        return;
+                    }
+                    stopPolling();
+                    hideLoading();
+                    showError(fbData.error || 'The backup engine could not finish this document.');
+                    return;
+                } catch (err) {
+                    stopPolling();
+                    hideLoading();
+                    showError('Could not reach the backup engine: ' + err.message);
+                    return;
+                }
+            }
 
             if (data.status === 'queued') {
                 const age = Number(data.age_seconds);
@@ -376,6 +468,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const audioUrlCache = new Map();   // sentence -> object URL (session cache)
     let audioEl = null;
     let speakToken = 0;
+    let serverTtsBroken = false;   // Piper lives in the Modal worker; see speakText()
     const ttsAborts = new Set();
 
     autoplayToggle.checked = localStorage.getItem('autoplay') === 'true';
@@ -428,6 +521,9 @@ document.addEventListener('DOMContentLoaded', function() {
             try { audioEl.pause(); } catch (e) { /* not playing */ }
             audioEl.removeAttribute('src');
         }
+        if ('speechSynthesis' in window) {
+            try { window.speechSynthesis.cancel(); } catch (e) { /* not speaking */ }
+        }
         document.querySelectorAll('.speak-btn.playing').forEach(function(btn) {
             btn.classList.remove('playing');
         });
@@ -449,7 +545,13 @@ document.addEventListener('DOMContentLoaded', function() {
             signal: controller.signal
         }).then(function(response) {
             if (response.status === 401) { expireAuth(); return null; }
-            if (!response.ok) throw new Error('tts ' + response.status);
+            if (!response.ok) {
+                // /api/tts is served by the GPU worker. If it is down (out of
+                // Modal credit, worker failing to boot) stop asking for every
+                // sentence and let the browser read aloud instead.
+                serverTtsBroken = true;
+                throw new Error('tts ' + response.status);
+            }
             return response.blob();
         }).then(function(blob) {
             if (!blob) return null;
@@ -471,6 +573,22 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    // Browser-native speech: free, no backend, works when the TTS worker is gone.
+    function speakWithBrowser(sentences, token) {
+        return new Promise(function(resolve) {
+            if (!('speechSynthesis' in window)) { resolve(); return; }
+            let i = 0;
+            function next() {
+                if (token !== speakToken || i >= sentences.length) { resolve(); return; }
+                const utterance = new SpeechSynthesisUtterance(sentences[i++]);
+                utterance.onend = next;
+                utterance.onerror = next;
+                window.speechSynthesis.speak(utterance);
+            }
+            next();
+        });
+    }
+
     // Stream-by-pipelining: play sentence N while sentence N+1 is already downloading.
     async function speakText(text, button) {
         stopSpeaking();
@@ -478,6 +596,15 @@ document.addEventListener('DOMContentLoaded', function() {
         const sentences = splitSentences(text);
         if (!sentences.length) return;
         if (button) button.classList.add('playing');
+
+        if (serverTtsBroken) {
+            try {
+                await speakWithBrowser(sentences, token);
+            } finally {
+                if (token === speakToken && button) button.classList.remove('playing');
+            }
+            return;
+        }
 
         try {
             let pending = fetchAudioUrl(sentences[0]);
@@ -580,14 +707,42 @@ document.addEventListener('DOMContentLoaded', function() {
         resultsStats.textContent =
             `${counts.easy} easy · ${counts.medium} medium · ${counts.hard} hard · ${sourced}/${flashcards.length} sourced`;
 
-        flashcardsContainer.innerHTML = '';
-        flashcards.forEach((card, index) => {
-            const flashcardEl = createFlashcardElement(card, index + 1);
-            flashcardsContainer.appendChild(flashcardEl);
-        });
+        reviewMode = false;
+        renderCurrentView();
 
         startStudyPing();   // keep the GPU warm for the next generation
     }
+
+    // Due count is always visible so the nudge exists before review mode is on.
+    function updateReviewButton() {
+        dueCount.textContent = String(dueCards(currentFlashcards).length);
+        reviewToggle.classList.toggle('active', reviewMode);
+        reviewToggle.setAttribute('aria-pressed', reviewMode ? 'true' : 'false');
+    }
+
+    function renderCurrentView() {
+        stopSpeaking();   // re-rendering replaces the audio buttons underneath playback
+        const cards = reviewMode ? shuffled(dueCards(currentFlashcards)) : currentFlashcards;
+        updateReviewButton();
+        flashcardsContainer.innerHTML = '';
+
+        if (reviewMode && cards.length === 0) {
+            const done = document.createElement('p');
+            done.className = 'review-empty';
+            done.textContent = '🎉 Nothing due right now — come back tomorrow, or turn Review due off to browse the deck.';
+            flashcardsContainer.appendChild(done);
+            return;
+        }
+
+        cards.forEach(function(card, index) {
+            flashcardsContainer.appendChild(createFlashcardElement(card, index + 1));
+        });
+    }
+
+    reviewToggle.addEventListener('click', function() {
+        reviewMode = !reviewMode;
+        renderCurrentView();
+    });
 
     function showError(message) {
         stopSpeaking();
@@ -606,16 +761,23 @@ document.addEventListener('DOMContentLoaded', function() {
         const rawDifficulty = (card.difficulty || '').toLowerCase();
         const difficulty = ['easy', 'medium', 'hard'].includes(rawDifficulty) ? rawDifficulty : '';
         const quote = (card.source_quote || '').trim();
+        const box = boxFor(card);
         const chip = difficulty
             ? `<span class="difficulty-chip ${difficulty}">${difficulty}</span>`
             : '';
+        const boxBadge = `<span class="box-badge" title="Leitner box ${box} of ${Leitner.MAX_BOX}">B${box}</span>`;
+        const gradeActions = reviewMode ? `
+                    <div class="grade-actions">
+                        <button class="grade-btn again" type="button">Again</button>
+                        <button class="grade-btn got" type="button">Got it</button>
+                    </div>` : '';
 
         flashcard.innerHTML = `
             <div class="flashcard-inner">
                 <div class="flashcard-side flashcard-front">
                     <div class="card-top">
                         <button class="speak-btn" type="button" title="Read question aloud" aria-label="Read question aloud">🔊</button>
-                        <div class="card-tags">${chip}</div>
+                        <div class="card-tags">${chip}${boxBadge}</div>
                         <span class="card-number">Q${number}</span>
                     </div>
                     <div class="card-body">
@@ -635,7 +797,8 @@ document.addEventListener('DOMContentLoaded', function() {
                         <button class="quote-toggle" type="button">📄 Show source</button>
                         <blockquote class="source-quote">${escapeHtml(quote)}</blockquote>` : ''}
                     </div>
-                    <div class="card-foot">tap to flip back</div>
+                    ${reviewMode ? '' : '<div class="card-foot">tap to flip back</div>'}
+                    ${gradeActions}
                 </div>
             </div>
         `;
@@ -656,6 +819,17 @@ document.addEventListener('DOMContentLoaded', function() {
                 const back = flashcard.querySelector('.flashcard-back');
                 const open = back.classList.toggle('quote-open');
                 quoteToggle.textContent = open ? '📄 Hide source' : '📄 Show source';
+            });
+        }
+
+        if (reviewMode) {
+            flashcard.querySelector('.grade-btn.again').addEventListener('click', function(e) {
+                e.stopPropagation();
+                gradeCard(card, false);
+            });
+            flashcard.querySelector('.grade-btn.got').addEventListener('click', function(e) {
+                e.stopPropagation();
+                gradeCard(card, true);
             });
         }
 

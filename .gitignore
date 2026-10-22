@@ -7,3 +7,5 @@ __pycache__/
 # dev-only UI preview artifacts (never deployed)
 preview.html
 .preview/
+.venv/
+gemini_cards.json

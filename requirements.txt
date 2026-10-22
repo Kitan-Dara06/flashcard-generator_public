@@ -5,3 +5,4 @@ python-pptx>=0.6.0
 upstash-redis>=1.0.0
 redis>=5.0.0
 modal>=0.67.0
+google-genai>=1.0.0

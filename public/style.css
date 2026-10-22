@@ -381,6 +381,113 @@ body.has-file .upload-label {
     font-size: 0.95em;
 }
 
+/* ============================================================
+   Leitner review mode
+   ============================================================ */
+.review-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    font-family: inherit;
+    font-size: 0.9em;
+    font-weight: 600;
+    color: var(--ink-soft);
+    background: var(--surface-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.review-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent-deep);
+}
+
+.review-toggle.active {
+    background: var(--accent-soft);
+    border-color: rgba(99, 102, 241, 0.4);
+    color: var(--accent-deep);
+}
+
+.due-count {
+    min-width: 20px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.8em;
+    font-weight: 700;
+    text-align: center;
+}
+
+.review-toggle.active .due-count {
+    background: var(--accent-deep);
+}
+
+.box-badge {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 3px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #fff;
+    opacity: 0.85;
+}
+
+.grade-actions {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 8px;
+    padding-top: 8px;
+}
+
+.grade-btn {
+    flex: 1;
+    padding: 7px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.grade-btn.again {
+    background: rgba(225, 29, 72, 0.09);
+    border-color: rgba(225, 29, 72, 0.35);
+    color: #be123c;
+}
+
+.grade-btn.again:hover {
+    background: rgba(225, 29, 72, 0.18);
+}
+
+.grade-btn.got {
+    background: rgba(5, 150, 105, 0.09);
+    border-color: rgba(5, 150, 105, 0.35);
+    color: #047857;
+}
+
+.grade-btn.got:hover {
+    background: rgba(5, 150, 105, 0.18);
+}
+
+.review-empty {
+    grid-column: 1 / -1;
+    padding: 40px 16px;
+    text-align: center;
+    color: var(--ink-soft);
+    background: var(--surface-dim);
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-md);
+    font-size: 0.95em;
+}
+
 .results-hint {
     color: var(--ink-faint, var(--ink-soft));
     font-size: 0.9em;

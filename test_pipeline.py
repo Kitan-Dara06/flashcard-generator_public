@@ -151,6 +151,8 @@ def main():
                         help="number of cards to synthesize audio for (0 = skip)")
     parser.add_argument("--cancel-after", type=int, default=0,
                         help="cancel the job this many seconds after submitting (0 = never)")
+    parser.add_argument("--provider", choices=["qwen", "gemini"], default=None,
+                        help="force an engine (default: let the server pick; gemini exercises the fallback)")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -201,8 +203,11 @@ def main():
 
     # 2. submit
     t_submit = time.time()
-    status, body = request_json(f"{base}/api/generate_flashcards", token, payload={
-        "file_content": encoded, "file_type": MIME_BY_SUFFIX[suffix]})
+    submit_payload = {"file_content": encoded, "file_type": MIME_BY_SUFFIX[suffix]}
+    if args.provider:
+        submit_payload["provider"] = args.provider
+    status, body = request_json(f"{base}/api/generate_flashcards", token,
+                                payload=submit_payload)
     if status == 0:
         fail(f"cannot reach {base}", body)
     if status == 400 or not isinstance(body, dict):

@@ -24,7 +24,7 @@ import modal
 APP_NAME = "flashcard-generator"
 # Bumped whenever worker behaviour changes; printed at container boot so logs can
 # be matched against the deployed source (deploys are otherwise indistinguishable).
-BUILD = "grounding-v2"
+BUILD = "grounding-v3"
 STUDY_TIMEZONE = "Africa/Lagos"  # <-- set to your users' timezone (Lagos = WAT, UTC+1)
 
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
@@ -43,11 +43,15 @@ TTS_VOICE = "en_US-lessac-medium"   # <-- change to any rhasspy/piper-voices voi
 
 SYSTEM_PROMPT = """You are a flashcard generator with no world knowledge. Treat the text below as your ONLY source of truth.
 
-For every flashcard you generate, you MUST include the source_quote field: the exact, verbatim sentence or phrase from the text that proves the answer is correct.
-You may rephrase the text for fluency and readability in the question and answer fields, but you MUST NOT invent any dates, names, numbers, or concepts not explicitly present in the source_quote.
+Rules you must never break:
+1. Never add background, definitions, examples, or context from your own knowledge - even if you are certain it is correct. If the text does not state it, it does not exist.
+2. If the text does not explicitly answer a question, do not write that card at all. There is no partial credit for a plausible guess.
+3. Every factual claim in the answer must be supported by the source_quote. If the answer needs a fact the quote lacks, remove the fact rather than supplying it yourself.
+4. The source_quote MUST be copied character-for-character from the text. Do not paraphrase it, summarise it, fix its spelling, or join sentences from different places.
+5. You must include source_quote on every card, plus a difficulty of easy, medium or hard.
+
+Produce between 15 and 40 flashcards depending on how much the text supports - quality over quantity, and never pad the list with restatements of the same fact.
 If the text contains no usable information, return an empty list of flashcards.
-Produce between 15 and 40 flashcards, depending on how much the text supports - quality over quantity, and never pad the list with restatements of the same fact.
-Rate each card's difficulty as easy, medium, or hard.
 Do not explain, apologise, or return any text outside the JSON object."""
 
 app = modal.App(APP_NAME)
@@ -147,6 +151,192 @@ def _parse_cards(raw: str) -> tuple[list[dict], bool]:
 def _dot(a, b) -> float:
     """Dot product; embeddings are normalized, so this is cosine similarity."""
     return float(sum(x * y for x, y in zip(a, b)))
+
+
+def _norm(text: str) -> str:
+    """Lowercase, collapse everything that is not alphanumeric into single spaces."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _quote_is_grounded(quote: str, chunk_norm: str, threshold: float = 0.85) -> bool:
+    """Is this quote actually in the source text?
+
+    The prompt asks for a verbatim copy and models still paraphrase or invent
+    quotes outright. An invented quote is the tell for parametric leakage: the
+    model wrote a plausible sentence and attributed it to the document.
+    """
+    quote_norm = _norm(quote)
+    if len(quote_norm) < 12:
+        return False
+    if quote_norm in chunk_norm:
+        return True
+    quote_words = quote_norm.split()
+    chunk_words = set(chunk_norm.split())
+    if not quote_words:
+        return False
+    coverage = sum(1 for w in quote_words if w in chunk_words) / len(quote_words)
+    return coverage >= threshold
+
+
+def _answer_numbers_grounded(answer: str, chunk_norm: str) -> bool:
+    """Every number in the answer must appear in the source text.
+
+    Dates and figures are the highest-value hallucination: a model that invents
+    "1974" when the text says "1973" passes every other check.
+    """
+    for token in re.findall(r"\d[\d.,]*", answer):
+        token = token.rstrip(".,")
+        if token and token not in chunk_norm:
+            return False
+    return True
+
+
+STOPWORDS = frozenset("""
+about above after again also although among any are because been before being
+below between both but can could did does doing down during each either few for
+from further had has have having here how into its itself just more most much
+not now off once only other our out over own same she should some such than that
+the their them then there these they this those through too under until very was
+were what when where which while who whom why will with would you your
+""".split())
+
+# Floor for gross answer/quote mismatch. Kept low on purpose: audit_cards.py
+# shows real answers cluster near 0.9, so a high cut-off only loses good cards.
+ANSWER_QUOTE_MIN_COVERAGE = float(os.environ.get("ANSWER_QUOTE_MIN_COVERAGE", "0.50"))
+
+
+def _content_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in STOPWORDS]
+
+
+def _capitalized_tokens(text: str):
+    """Capitalised words that are not merely capitalised for sentence position."""
+    for match in re.finditer(r"[A-Za-z][A-Za-z'\u2019\-]*", text or ""):
+        word = match.group(0)
+        if not word[0].isupper():
+            continue
+        before = (text[:match.start()] or "").rstrip()
+        if not before or before[-1] in ".:;!?-\n(\"\u201c'":
+            continue
+        yield word
+
+
+def _ungrounded_names(answer: str, quote: str) -> list[str]:
+    """Names in the answer that its own quote never mentions.
+
+    ADVISORY ONLY - reported, never used to drop a card. Capitalisation is a
+    weak proxy for "named entity": it misfires on abbreviations, on adjectives
+    derived from names ("Nigerian" vs "Nigeria"), and on sentences the model
+    starts mid-string. The enforcing gates are the verbatim-quote check and the
+    number check.
+    """
+    quote_norm = _norm(quote)
+    quote_words = set(_content_words(quote))
+    missing = []
+    for word in _capitalized_tokens(answer):
+        lower = word.lower()
+        if len(lower) < 3 or lower in STOPWORDS:
+            continue
+        if lower in quote_norm:
+            continue
+        # "Nigerian" should count as covered by "Nigeria".
+        if len(lower) >= 5 and any(w.startswith(lower[:5]) for w in quote_words
+                                   if len(w) >= 5):
+            continue
+        missing.append(word)
+    return missing
+
+
+def _answer_coverage(answer: str, quote: str) -> float:
+    answer_words = _content_words(answer)
+    if not answer_words:
+        return 1.0
+    quote_words = set(_content_words(quote))
+    if not quote_words:
+        return 0.0
+    return sum(1 for w in answer_words if w in quote_words) / len(answer_words)
+
+
+def _clean_cards(items, chunk: str = "") -> tuple[list[dict], int]:
+    """Normalise the model's cards and drop anything not grounded in `chunk`.
+
+    Two gates, both cheap:
+      1. no source_quote at all -> dropped (the model asserted something it
+         cannot point at).
+      2. source_quote not found in the chunk, or a number in the answer that
+         the chunk never mentions -> dropped (parametric leakage: the model
+         used its own knowledge instead of the document).
+
+    Pass chunk="" to skip gate 2 (only when the source text is unavailable).
+    Returns (cards, dropped).
+    """
+    chunk_norm = _norm(chunk) if chunk else ""
+    cards: list[dict] = []
+    dropped_ungrounded = 0
+    dropped_leaky = 0
+    dropped_drifted = 0
+    flagged_names = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        quote = str(item.get("source_quote", "")).strip()
+        difficulty = str(item.get("difficulty", "")).strip().lower()
+        if difficulty not in ("easy", "medium", "hard"):
+            difficulty = "medium"
+        if not (question and answer):
+            continue
+        if not quote:
+            dropped_ungrounded += 1
+            continue
+        if chunk_norm and not _quote_is_grounded(quote, chunk_norm):
+            dropped_leaky += 1
+            continue
+        if chunk_norm and not _answer_numbers_grounded(answer, chunk_norm):
+            dropped_leaky += 1
+            continue
+        if chunk_norm:
+            # Reported, never enforced - see _ungrounded_names().
+            names = _ungrounded_names(answer, quote)
+            if names:
+                flagged_names += 1
+        # Short answers cannot drift far; only judge once there is enough of an
+        # answer to be worth judging.
+        if (len(_content_words(answer)) > 6
+                and _answer_coverage(answer, quote) < ANSWER_QUOTE_MIN_COVERAGE):
+            dropped_drifted += 1
+            continue
+        cards.append({
+            "question": question,
+            "answer": answer,
+            "source_quote": quote,
+            "difficulty": difficulty,
+        })
+    if dropped_ungrounded:
+        print(f"dropped {dropped_ungrounded} card(s) with no source_quote")
+    if dropped_leaky:
+        print(f"dropped {dropped_leaky} card(s) whose quote/numbers/names are not in the source")
+    if dropped_drifted:
+        print(f"dropped {dropped_drifted} card(s) whose answer drifts beyond its quote")
+    if flagged_names:
+        print(f"advisory: {flagged_names} card(s) mention a name absent from their quote "
+              f"(kept - review manually)")
+    return cards, dropped_ungrounded + dropped_leaky + dropped_drifted
+
+
+def _job_access(job_id: str):
+    """Redis client plus the job-scoped key/write helpers both workers use."""
+    r = _redis_client()
+
+    def key(suffix: str) -> str:
+        return f"job:{job_id}:{suffix}"
+
+    def write(suffix: str, value: str) -> None:
+        r.set(key(suffix), value, ex=REDIS_TTL_SECONDS)
+
+    return r, key, write
 
 
 def _redis_url() -> str | None:
@@ -340,13 +530,7 @@ class FlashcardLLM:
                 "--force upstash REDIS_URL=..."
             )
 
-        r = _redis_client()
-
-        def key(suffix: str) -> str:
-            return f"job:{job_id}:{suffix}"
-
-        def write(suffix: str, value: str) -> None:
-            r.set(key(suffix), value, ex=REDIS_TTL_SECONDS)
+        r, key, write = _job_access(job_id)
 
         try:
             # Cheap fix for abandoned jobs: the cancel flag is honoured before
@@ -356,6 +540,10 @@ class FlashcardLLM:
                 return
 
             write("status", "processing")
+            # Stamped into logs and into any error message: when a warm container
+            # from an older deploy is still serving, this is what tells you which
+            # code actually ran.
+            print(f"job {job_id}: build={BUILD}")
 
             text = r.get(key("text"))
             if not text:
@@ -404,7 +592,7 @@ class FlashcardLLM:
             write("status", "complete")
         except Exception as exc:
             try:
-                write("error", f"{type(exc).__name__}: {exc}")
+                write("error", f"[{BUILD}] {type(exc).__name__}: {exc}")
                 write("status", "error")
             except Exception as nested:
                 # Redis itself is unusable; the Modal log is the only record.
@@ -482,32 +670,7 @@ class FlashcardLLM:
         if truncated:
             print(f"response hit the token limit - salvaged {len(items)} card(s)")
 
-        cards = []
-        dropped_ungrounded = 0
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            question = str(item.get("question", "")).strip()
-            answer = str(item.get("answer", "")).strip()
-            quote = str(item.get("source_quote", "")).strip()
-            difficulty = str(item.get("difficulty", "")).strip().lower()
-            if difficulty not in ("easy", "medium", "hard"):
-                difficulty = "medium"
-            if not (question and answer):
-                continue
-            if not quote:
-                # Ungrounded: the model asserted something it cannot point at in
-                # the source text. Dropped rather than shipped.
-                dropped_ungrounded += 1
-                continue
-            cards.append({
-                "question": question,
-                "answer": answer,
-                "source_quote": quote,
-                "difficulty": difficulty,
-            })
-        if dropped_ungrounded:
-            print(f"dropped {dropped_ungrounded} ungrounded card(s) (no source_quote)")
+        cards, _dropped = _clean_cards(items, chunk)
         return cards
 
     def _dedup(self, cards: list[dict]) -> list[dict]:
@@ -545,6 +708,7 @@ class FlashcardLLM:
 def keep_warm() -> None:
     """Put the LLM container into a warm state without running a job."""
     FlashcardLLM().ping.remote()
+
 
 
 @app.function(image=image, volumes={"/cache": hf_cache}, timeout=3600)

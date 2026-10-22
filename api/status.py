@@ -158,8 +158,13 @@ def lambda_handler(event):
             payload["age_seconds"] = age
 
         if status == "queued" and age is not None and age > QUEUED_STALE_SECONDS:
+            # The GPU worker never picked the job up. Report it and let the client
+            # decide: it can re-submit the job_id to /api/generate_flashcards to
+            # run it on the Gemini fallback instead, which lives in Vercel and so
+            # still works when Modal itself is the broken part.
             payload["status"] = "error"
             payload["stalled"] = True
+            payload["fallback_available"] = True
             payload["error"] = (
                 f"The AI worker never started (queued for {age // 60} min). "
                 "It may be cold-starting unusually slowly, or it failed to boot - "
