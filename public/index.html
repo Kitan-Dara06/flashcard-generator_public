@@ -3,89 +3,115 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎯 AI Flashcard Generator</title>
+    <meta name="theme-color" content="#4f46e5">
+    <title>Study Decks</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="bg-glow" aria-hidden="true"></div>
 
-    <div id="passwordOverlay" class="password-overlay">
-        <div class="password-prompt">
-            <div class="password-icon">🔒</div>
-            <h2>Welcome back</h2>
-            <p class="password-subtitle">Enter the access password to continue</p>
-            <input type="password" id="passwordInput" placeholder="Password" autocomplete="off" />
-            <button id="passwordSubmit">Unlock app</button>
-            <p id="passwordError" class="password-error hidden">❌ Incorrect password</p>
-        </div>
-    </div>
-
     <div class="container">
         <header>
             <span class="brand-chip">✦ AI-powered</span>
-            <h1>Flashcard Generator</h1>
-            <p>Drop in a lecture note, slide deck, or PDF — get a study deck in seconds.</p>
+            <h1>Study Decks</h1>
+            <p>Turn a document into flashcards and a podcast — then study them anywhere.</p>
         </header>
 
         <main>
-            <div class="upload-section">
-                <div class="file-upload">
-                    <input type="file" id="fileInput" accept=".pdf,.txt,.docx,.pptx" />
-                    <label for="fileInput" class="upload-label">
-                        <span class="upload-icon" aria-hidden="true">📄</span>
-                        <span class="upload-title">Drop your document here</span>
-                        <span class="upload-hint">or click to browse — PDF, TXT, DOCX, PPTX · max 3 MB</span>
-                    </label>
-                    <div id="fileChip" class="file-chip hidden">
-                        <span id="fileChipName"></span>
-                        <button id="fileChipRemove" type="button" aria-label="Remove file">✕</button>
-                    </div>
-                </div>
-
-                <button id="generateBtn" class="generate-btn" disabled>
-                    🧠 Generate Flashcards
-                </button>
-            </div>
-
-            <div id="loading" class="loading hidden">
-                <div class="spinner"></div>
-                <p id="loadingText">Working…</p>
-                <div class="progress-track">
-                    <div id="progressBar" class="progress-bar"></div>
-                </div>
-                <button id="cancelBtn" class="cancel-btn">✕ Cancel</button>
-            </div>
-
-            <div id="results" class="results hidden">
-                <div class="results-header">
-                    <div class="results-heading">
-                        <h2 id="resultsCount"></h2>
-                        <p id="resultsStats" class="results-stats"></p>
-                    </div>
-                    <div class="results-actions">
-                        <button id="reviewToggle" class="review-toggle" type="button" aria-pressed="false">
-                            🔁 Review due <span id="dueCount" class="due-count">0</span>
-                        </button>
-                        <label class="autoplay-toggle" title="Read each side aloud when you flip a card">
-                            <input type="checkbox" id="autoplayToggle" />
-                            <span>🔊 Auto-read</span>
+            <!-- ============ HOME ============ -->
+            <div id="homeView">
+                <section class="upload-section" id="uploadSection">
+                    <div class="file-upload">
+                        <input type="file" id="fileInput" accept=".pdf,.txt,.docx,.pptx" />
+                        <label for="fileInput" class="upload-label">
+                            <span class="upload-icon" aria-hidden="true">📄</span>
+                            <span class="upload-title">Drop a new document here</span>
+                            <span class="upload-hint">or click to browse — PDF, TXT, DOCX, PPTX · max 3 MB</span>
                         </label>
-                        <button id="downloadBtn" class="download-btn">💾 Download JSON</button>
+                        <div id="fileChip" class="file-chip hidden">
+                            <span id="fileChipName"></span>
+                            <button id="fileChipRemove" type="button" aria-label="Remove file">✕</button>
+                        </div>
                     </div>
+                    <button id="generateBtn" class="generate-btn" disabled>🧠 Generate Flashcards</button>
+                    <div id="loading" class="loading hidden">
+                        <div class="spinner"></div>
+                        <p id="loadingText">Working…</p>
+                        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+                        <button id="cancelBtn" class="cancel-btn">✕ Cancel</button>
+                    </div>
+                </section>
+
+                <section class="deck-list-section">
+                    <h2 class="section-title">Your decks</h2>
+                    <p id="noDecks" class="section-hint">No decks yet — drop a document above to make your first one.</p>
+                    <div id="deckList" class="deck-list"></div>
+                </section>
+            </div>
+
+            <!-- ============ DECK ============ -->
+            <div id="deckView" class="hidden">
+                <div class="deck-header">
+                    <button id="backBtn" class="back-btn" type="button" aria-label="Back to decks">← Decks</button>
+                    <div class="deck-heading">
+                        <h2 id="deckTitle"></h2>
+                        <p id="deckMeta" class="deck-meta"></p>
+                    </div>
+                    <button id="podcastBtn" class="podcast-btn" type="button">🎧 Podcast</button>
+                    <button id="exportBtn" class="download-btn" type="button">⬇ CSV</button>
                 </div>
-                <p class="results-hint">Click a card to flip it · 🔊 reads a side aloud · "Show source" reveals the sentence the answer came from.</p>
-                <div id="flashcards" class="flashcard-container"></div>
+
+                <div class="deck-controls">
+                    <div class="tabs" role="tablist">
+                        <button class="tab active" data-filter="all" type="button">All <span id="allCount"></span></button>
+                        <button class="tab" data-filter="starred" type="button">⭐ Starred <span id="starredCount"></span></button>
+                    </div>
+                    <input type="search" id="searchInput" class="search-input" placeholder="Search cards…" autocomplete="off" />
+                    <button id="shuffleBtn" class="icon-btn" type="button" title="Shuffle order">🔀</button>
+                </div>
+
+                <p id="emptyFilter" class="section-hint hidden">No cards match this view.</p>
+                <div id="studyCard" class="study-card"></div>
+                <div class="study-nav">
+                    <button id="prevBtn" class="nav-btn" type="button" aria-label="Previous card">←</button>
+                    <span id="studyProgress" class="study-progress"></span>
+                    <button id="nextBtn" class="nav-btn" type="button" aria-label="Next card">→</button>
+                </div>
+                <p class="keyboard-hint">space = flip · ← / → = navigate · S = star · / = search</p>
             </div>
 
             <div id="error" class="error hidden"></div>
         </main>
 
         <footer class="app-footer">
-            <span>Deduplicated cards · Powered by Qwen 2.5 on Modal</span>
+            <span>Saved on this device · Powered by Qwen 2.5 + Gemini on Modal</span>
         </footer>
     </div>
 
-    <script src="leitner.js"></script>
+    <!-- ============ PODCAST ============ -->
+    <div id="podcastPanel" class="podcast-overlay hidden">
+        <div class="podcast-modal">
+            <div class="podcast-header">
+                <h2 id="podcastTitle">Podcast</h2>
+                <button id="podcastClose" class="back-btn" type="button" aria-label="Close">✕</button>
+            </div>
+            <div class="podcast-body">
+                <div class="podcast-actions">
+                    <button id="podcastGenScript" class="generate-btn" type="button">Generate podcast script</button>
+                    <button id="podcastGenAudio" class="generate-btn hidden" type="button">Generate audio</button>
+                    <p id="podcastStatus" class="section-hint"></p>
+                </div>
+                <div id="podcastPlayer" class="podcast-player hidden">
+                    <button id="podcastPlay" class="nav-btn" type="button" aria-label="Play">▶</button>
+                    <div class="podcast-progress-track"><div id="podcastProgress" class="podcast-progress"></div></div>
+                    <span id="podcastTime" class="podcast-time">0:00</span>
+                </div>
+                <div id="podcastTranscript" class="podcast-transcript"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="db.js"></script>
     <script src="script.js"></script>
 </body>
 </html>

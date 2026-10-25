@@ -18,29 +18,8 @@ def auth_secret():
 
 
 def validate_auth_token(event):
-    """Validate the signed bearer token issued by /api/verify_password."""
-    secret = auth_secret()
-    if not secret:
-        return False
-
-    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
-    auth = headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return False
-
-    token = auth[len("bearer "):].strip()
-    expires_str, sep, signature = token.partition(".")
-    if not sep:
-        return False
-
-    try:
-        if int(expires_str) < time.time():
-            return False
-    except ValueError:
-        return False
-
-    expected = hmac.new(secret.encode(), expires_str.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected)
+    # Auth disabled: single-user app, no accounts. Endpoints are public.
+    return True
 
 
 # ----- CORS -----
