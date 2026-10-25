@@ -87,7 +87,8 @@
         // newest first; enrich with card + starred counts
         const enriched = [];
         for (const deck of decks) {
-            const cards = (await get(db, STORES.cards, deck.id)) || [];
+            const record = await get(db, STORES.cards, deck.id);
+            const cards = (record && record.cards) || [];
             enriched.push({
                 id: deck.id,
                 title: deck.title,
@@ -109,7 +110,8 @@
 
     async function getCards(id) {
         const db = await open();
-        return (await get(db, STORES.cards, id)) || [];
+        const record = await get(db, STORES.cards, id);
+        return (record && record.cards) || [];
     }
 
     async function saveDeck(deck, cards) {

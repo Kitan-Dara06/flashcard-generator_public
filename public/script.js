@@ -144,10 +144,15 @@
             } catch (e) { await wait(POLL_INTERVAL_MS); continue; }
 
             if (data.status === 'complete') {
-                await persistDeck(data.cards, sourceName, data.provider || 'qwen', data.text || '');
-                hideLoading();
-                setFile(null);
-                openDeck(currentDeckId);
+                try {
+                    await persistDeck(data.cards, sourceName, data.provider || 'qwen', data.text || '');
+                    hideLoading();
+                    setFile(null);
+                    await openDeck(currentDeckId);
+                } catch (e) {
+                    hideLoading();
+                    showError('Saved the deck but failed to open it: ' + e.message);
+                }
                 return;
             } else if (data.status === 'error') {
                 hideLoading();
