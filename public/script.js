@@ -779,10 +779,17 @@
     podcastGenAudio.addEventListener('click', generateAudio);
     podcastPlay.addEventListener('click', togglePodcastPlay);
 
-    // service worker (offline app shell)
+    // service worker (offline app shell). updateViaCache:'none' stops the
+    // browser from serving an old sw.js out of its HTTP cache, so deploys land.
     if ('serviceWorker' in navigator) {
+        let hadController = !!navigator.serviceWorker.controller;
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+            if (!hadController) { hadController = true; return; }  // first install
+            window.location.reload();                             // new SW took over
+        });
         window.addEventListener('load', function () {
-            navigator.serviceWorker.register('/sw.js').catch(function () { /* offline-in-dev or unsupported */ });
+            navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+                .catch(function () { /* unsupported / file:// */ });
         });
     }
 
