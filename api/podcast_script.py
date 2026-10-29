@@ -3,20 +3,23 @@
 # Body: { "text": "..." }  ->  { "title": "...", "turns": [{"speaker","text"}, ...] }
 import json
 import os
+import sys
 from http.server import BaseHTTPRequestHandler
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# The prompt is data (api/prompts/podcast.yaml); generation goes through the same
+# engine chain as the cards, so a script still works when the Gemini key is out of
+# credit and Zen is carrying the load.
+from generate_flashcards import (
+    EngineFailure,
+    generate_json,
+    json_response,
+    prompt_text,
+    resolve_cors_headers,
+)
+
 SCRIPT_MODEL = os.environ.get("PODCAST_SCRIPT_MODEL", "gemini-2.5-flash")
-
-SYSTEM_PROMPT = """You are writing a podcast conversation between two hosts, Alex and Sam, about the document provided.
-
-Rules:
-- Cover only the key concepts: the main ideas a student must remember. Skip tables of contents, bibliographies, headers, and low-value detail.
-- Aim for a conversation that runs about 5-8 minutes when read aloud (roughly 700-1100 words).
-- Tone: warm, clear and curious, like two knowledgeable hosts explaining the material to a student. Not a dry summary - actually discuss the ideas.
-- Ground every claim in the document. Do not add outside facts, dates, names or context. If the document does not say it, do not say it.
-- Alternate speakers naturally. Alex introduces and summarises; Sam asks the clarifying questions a student would ask and draws out the "why".
-- Open with a one-sentence hook and close with a short "if you remember three things" wrap-up.
-- Return JSON only."""
 
 
 def schema():
@@ -41,60 +44,54 @@ def schema():
 
 
 def generate_script(text: str) -> dict:
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        response_mime_type="application/json",
-        response_schema=schema(),
-        temperature=0.7,
-        max_output_tokens=8192,
-    )
-    response = client.models.generate_content(
-        model=SCRIPT_MODEL, contents=text, config=config)
-    data = json.loads(response.text)
-    turns = [t for t in data.get("turns", []) if t.get("speaker") in ("Alex", "Sam") and str(t.get("text", "")).strip()]
+    _engine, raw = generate_json(prompt_text("podcast"), text, schema(),
+                                 temperature=0.7)
+    data = json.loads(raw)
+    turns = [t for t in data.get("turns", [])
+             if t.get("speaker") in ("Alex", "Sam") and str(t.get("text", "")).strip()]
     return {"title": data.get("title", "Podcast"), "turns": turns}
-
-
-def _json(status, payload):
-    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
 
 
 def lambda_handler(event):
     try:
         if event["httpMethod"] != "POST":
-            return _json(405, {"success": False, "error": "Method not allowed"})
+            return json_response(405, {"success": False, "error": "Method not allowed"})
 
         try:
             body = json.loads(event["body"])
             text = str(body.get("text", "")).strip()
         except (TypeError, ValueError):
-            return _json(400, {"success": False, "error": "Malformed request body"})
+            return json_response(400, {"success": False, "error": "Malformed request body"})
 
         if not text:
-            return _json(400, {"success": False, "error": "Missing text"})
+            return json_response(400, {"success": False, "error": "Missing text"})
         if len(text) > 500_000:
-            return _json(400, {"success": False, "error": "Text too long"})
+            return json_response(400, {"success": False, "error": "Text too long"})
 
         try:
             result = generate_script(text)
+        except EngineFailure as exc:
+            print("Script generation failed:", repr(exc))
+            status = 503 if exc.kind in ("quota", "transient") else 502
+            return json_response(status, {"success": False,
+                                          "error": "Script generation failed",
+                                          "details": str(exc)})
         except Exception as exc:
             print("Script generation failed:", repr(exc))
-            return _json(502, {"success": False, "error": "Script generation failed", "details": str(exc)})
+            return json_response(502, {"success": False,
+                                       "error": "Script generation failed",
+                                       "details": str(exc)})
 
         if not result["turns"]:
-            return _json(502, {"success": False, "error": "No turns generated"})
+            return json_response(502, {"success": False, "error": "No turns generated"})
 
-        return _json(200, {"success": True, **result})
+        return json_response(200, {"success": True, **result})
 
     except Exception as e:
         import traceback
         print("Unhandled error:", str(e))
         print(traceback.format_exc())
-        return _json(500, {"success": False, "error": str(e)})
+        return json_response(500, {"success": False, "error": str(e)})
 
 
 class handler(BaseHTTPRequestHandler):
@@ -112,5 +109,7 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8")
-        response = lambda_handler({"httpMethod": "POST", "headers": dict(self.headers), "body": body})
+        event = {"httpMethod": "POST", "headers": dict(self.headers), "body": body}
+        response = lambda_handler(event)
+        response.setdefault("headers", {}).update(resolve_cors_headers(event))
         self._send(response)

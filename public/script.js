@@ -63,6 +63,11 @@
     let filter = 'all';
     let fallbackTried = false;
     let currentJobId = null;
+    // Set by the Cancel button. The generation loops check it between requests so
+    // cancelling actually stops the work instead of only hiding the spinner -
+    // without it the chunk loop kept firing (and kept paying) for minutes, then
+    // saved and opened the deck anyway.
+    let cancelRequested = false;
     let podcast = null;          // { title, turns }
     let podcastSegs = [];        // [{ turns:[idx], url, duration }]
     let podAudio = null;
@@ -113,6 +118,11 @@
         if (!file) return;
         if (file.size > MAX_UPLOAD_BYTES) { showError('File too large (max 3 MB).'); return; }
         showLoading('Uploading and extracting text…');
+        // The API generates one section group per request, so nothing appears to
+        // happen for the first few seconds while the text is extracted.
+        let hintTimer = setTimeout(function () {
+            updateLoadingText('Generating cards… this can take up to a minute.');
+        }, 4000);
         try {
             const dataUrl = await fileToBase64(file);
             const b64 = dataUrl.split(',')[1];
@@ -122,20 +132,120 @@
                 body: JSON.stringify({ file_content: b64, file_type: file.type })
             });
             const data = await resp.json();
+            clearTimeout(hintTimer);
             if (!data.success) { hideLoading(); showError(data.message || data.error || 'Failed to start'); return; }
             currentJobId = data.job_id;
             fallbackTried = false;
-            await pollJob(currentJobId, file.name);
+            cancelRequested = false;
+            // The API answers with a chunk plan: one request per section group.
+            if (data.chunks > 0) {
+                await runChunks(currentJobId, data.chunks, file.name);
+            } else {
+                await pollJob(currentJobId, file.name);
+            }
         } catch (err) {
+            clearTimeout(hintTimer);
             hideLoading();
             showError('Generation failed: ' + err.message);
         }
+    }
+
+    // Drive Gemini one section group at a time. Each call is a few tens of
+    // seconds - inside the serverless limit - and progress is real.
+    async function runChunks(jobId, total, sourceName) {
+        for (let i = 0; i < total; i++) {
+            if (cancelRequested) return;
+            updateLoadingText('Generating cards… (section group ' + (i + 1) + ' of ' + total + ')');
+            setProgress(Math.round((i / total) * 100));
+
+            let data = {};
+            let ok = false;
+            try {
+                const resp = await fetch('/api/generate_flashcards', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, chunk: i })
+                });
+                data = await resp.json().catch(function () { return {}; });
+                ok = resp.ok && data.success;
+            } catch (err) {
+                hideLoading();
+                showError('Lost connection while generating: ' + err.message);
+                return;
+            }
+
+            if (data.quota || data.unavailable) {
+                // Every API engine is out of credit or overloaded: hand the job to Modal.
+                updateLoadingText((data.quota
+                    ? 'Out of API credit — switching to the backup engine…'
+                    : 'The API is busy — switching to the backup engine…'));
+                setProgress(-1);
+                try {
+                    await fetch('/api/generate_flashcards', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ job_id: jobId, provider: 'qwen' })
+                    });
+                } catch (e) { /* pollJob reports the failure */ }
+                await pollJob(jobId, sourceName);
+                return;
+            }
+
+            if (data.cancelled) return;      // the server saw the cancel flag
+
+            if (!ok) {
+                hideLoading();
+                showError(data.error || 'Generation failed at section group ' + (i + 1));
+                return;
+            }
+
+            if (cancelRequested) return;
+            setProgress(Math.round(((i + 1) / total) * 100));
+            if (data.final) break;   // merged and deduped server-side
+        }
+        if (cancelRequested) return;
+        await finishJob(jobId, sourceName);
+    }
+
+    async function finishJob(jobId, sourceName) {
+        let data = {};
+        try {
+            const resp = await fetch('/api/status?job_id=' + encodeURIComponent(jobId));
+            data = await resp.json();
+        } catch (e) {
+            hideLoading();
+            showError('Could not read the finished job: ' + e.message);
+            return;
+        }
+        if (data.status === 'complete') {
+            hideLoading();
+            setFile(null);
+            try {
+                await persistDeck(data.cards, sourceName, data.provider || 'api', data.text || '');
+                await openDeck(currentDeckId);
+                if (data.note) deckMeta.textContent += ' · ' + data.note;
+            } catch (e) {
+                showError('Saved the deck but failed to open it: ' + e.message);
+            }
+            return;
+        }
+        if (data.status === 'error') {
+            hideLoading();
+            showError(data.error || 'Generation failed');
+            return;
+        }
+        if (data.status === 'cancelled') {
+            hideLoading();
+            return;
+        }
+        await pollJob(jobId, sourceName);
     }
 
     async function pollJob(jobId, sourceName) {
         const startedAt = Date.now();
         let lastProgress = '';
         while (true) {
+            if (cancelRequested) return;
             if (Date.now() - startedAt > MAX_JOB_MS) { hideLoading(); showError('Taking unusually long.'); return; }
             let data;
             try {
@@ -145,10 +255,11 @@
 
             if (data.status === 'complete') {
                 try {
-                    await persistDeck(data.cards, sourceName, data.provider || 'qwen', data.text || '');
+                    await persistDeck(data.cards, sourceName, data.provider || 'api', data.text || '');
                     hideLoading();
                     setFile(null);
                     await openDeck(currentDeckId);
+                    if (data.note) deckMeta.textContent += ' · ' + data.note;
                 } catch (e) {
                     hideLoading();
                     showError('Saved the deck but failed to open it: ' + e.message);
@@ -157,6 +268,9 @@
             } else if (data.status === 'error') {
                 hideLoading();
                 showError(data.error || 'Generation failed');
+                return;
+            } else if (data.status === 'cancelled') {
+                hideLoading();
                 return;
             } else if (data.status === 'processing') {
                 const p = data.progress || '';
@@ -180,7 +294,15 @@
                             body: JSON.stringify({ job_id: jobId, provider: 'gemini' })
                         });
                         const fbData = await fb.json().catch(function () { return {}; });
-                        if (fb.ok && fbData.success) continue;
+                        if (fb.ok && fbData.success) {
+                            // The server handed back a chunk plan: drive it here
+                            // rather than waiting for a worker that never started.
+                            if (fbData.chunks > 0) {
+                                await runChunks(jobId, fbData.chunks, sourceName);
+                                return;
+                            }
+                            continue;
+                        }
                         hideLoading();
                         showError(fbData.error || 'Backup engine failed.');
                         return;
@@ -762,6 +884,10 @@
     fileInput.addEventListener('change', function (e) { setFile(e.target.files[0] || null); });
     fileChipRemove.addEventListener('click', function () { setFile(null); });
     cancelBtn.addEventListener('click', function () {
+        // Stop the loops first, then tell the server: the flag is what makes an
+        // in-flight chunk sequence actually stop instead of finishing in the
+        // background and opening the deck anyway.
+        cancelRequested = true;
         if (currentJobId) {
             fetch('/api/cancel', {
                 method: 'POST',
@@ -769,6 +895,7 @@
                 body: JSON.stringify({ job_id: currentJobId })
             }).catch(function () {});
         }
+        currentJobId = null;
         hideLoading();
     });
 

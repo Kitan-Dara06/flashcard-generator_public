@@ -18,14 +18,19 @@ import json
 import os
 import re
 import struct
+import sys
 
 import modal
 
 APP_NAME = "flashcard-generator"
-# Bumped whenever worker behaviour changes; printed at container boot so logs can
-# be matched against the deployed source (deploys are otherwise indistinguishable).
-BUILD = "grounding-v3"
+
+BUILD = "zen-v1"
 STUDY_TIMEZONE = "Africa/Lagos"  # <-- set to your users' timezone (Lagos = WAT, UTC+1)
+# Where the shared card rules and prompts land inside the container. They are
+# mounted from api/ below rather than copied, so there is exactly one definition
+# of "what a valid card is" and one copy of each prompt.
+SHARED_DIR = "/root/shared"
+PROMPT_DIR = "/root/prompts"
 
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
@@ -39,20 +44,16 @@ REDIS_TTL_SECONDS = 24 * 60 * 60
 
 # Text-to-speech (Piper, runs on CPU in this same container)
 TTS_VOICE_REPO = "rhasspy/piper-voices"
-TTS_VOICE = "en_US-lessac-medium"   # <-- change to any rhasspy/piper-voices voice
 
-SYSTEM_PROMPT = """You are a flashcard generator with no world knowledge. Treat the text below as your ONLY source of truth.
 
-Rules you must never break:
-1. Never add background, definitions, examples, or context from your own knowledge - even if you are certain it is correct. If the text does not state it, it does not exist.
-2. If the text does not explicitly answer a question, do not write that card at all. There is no partial credit for a plausible guess.
-3. Every factual claim in the answer must be supported by the source_quote. If the answer needs a fact the quote lacks, remove the fact rather than supplying it yourself.
-4. The source_quote MUST be copied character-for-character from the text. Do not paraphrase it, summarise it, fix its spelling, or join sentences from different places.
-5. You must include source_quote on every card, plus a difficulty of easy, medium or hard.
+def _tts_voice() -> str:
+    """The Piper voice, read from the shared module.
 
-Produce between 15 and 40 flashcards depending on how much the text supports - quality over quantity, and never pad the list with restatements of the same fact.
-If the text contains no usable information, return an empty list of flashcards.
-Do not explain, apologise, or return any text outside the JSON object."""
+    api/tts.py hashes this value into the audio cache key, so the two must agree
+    exactly or cached clips get served for the wrong voice. One definition, in
+    api/generate_flashcards.py, removes the possibility.
+    """
+    return _shared().TTS_VOICE
 
 app = modal.App(APP_NAME)
 
@@ -77,253 +78,50 @@ image = (
         "piper-tts>=1.2.0",
         "upstash-redis>=1.0.0",
         "redis>=5.0.0",
+        # The prompts are YAML (api/prompts/*.yaml), shared with the Vercel side.
+        "pyyaml>=6.0",
     )
     .env({"HF_HOME": "/cache"})
+    # The card rules, chunking-by-section fallback and prompt loader are the same
+    # code the Vercel functions run - mounted, not re-pasted here, so the two
+    # engines cannot drift apart.
+    .add_local_file(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "api", "generate_flashcards.py"),
+        remote_path=os.path.join(SHARED_DIR, "generate_flashcards.py"),
+        copy=True,
+    )
+    .add_local_dir(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "prompts"),
+        remote_path=PROMPT_DIR,
+        copy=True,
+    )
 )
 
 hf_cache = modal.Volume.from_name("flashcard-hf-cache", create_if_missing=True)
 redis_secret = modal.Secret.from_name("upstash")
 
+_SHARED = None
 
-def _flashcard_schema() -> dict:
-    """JSON schema for vLLM's guided decoder, so output is always valid JSON.
 
-    source_quote is required: making the model *find* a supporting sentence is
-    what keeps a small model from leaking its own training knowledge into the
-    cards (and it gives the UI something to show for trust).
+def _shared():
+    """api/generate_flashcards.py, imported from the mounted copy.
+
+    Imported lazily: this module is also executed locally by `modal` to build
+    the app, where SHARED_DIR does not exist yet.
     """
-    return {
-        "type": "object",
-        "properties": {
-            "flashcards": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string"},
-                        "answer": {"type": "string"},
-                        "source_quote": {"type": "string"},
-                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
-                    },
-                    "required": ["question", "answer", "source_quote", "difficulty"],
-                },
-            }
-        },
-        "required": ["flashcards"],
-    }
-
-
-def _parse_cards(raw: str) -> tuple[list[dict], bool]:
-    """Extract the card list from the model's response, salvaging a truncated one.
-
-    Guided decoding guarantees valid JSON *unless* the response is cut off by
-    max_tokens mid-string, which leaves an unterminated string and makes
-    json.loads raise. Rather than lose the whole chunk, walk the array and keep
-    every complete card object before the cut-off point.
-
-    Returns (cards, truncated).
-    """
-    try:
-        return list(json.loads(raw).get("flashcards") or []), False
-    except json.JSONDecodeError:
-        pass
-
-    decoder = json.JSONDecoder()
-    pos = raw.find("[")
-    if pos < 0:
-        return [], True
-    pos += 1
-    cards: list[dict] = []
-    while True:
-        brace = raw.find("{", pos)
-        if brace < 0:
-            break
-        try:
-            obj, end = decoder.raw_decode(raw, brace)
-        except json.JSONDecodeError:
-            break        # this is the card the token limit cut in half
-        if isinstance(obj, dict):
-            cards.append(obj)
-        pos = end
-    return cards, True
+    global _SHARED
+    if _SHARED is None:
+        if SHARED_DIR not in sys.path:
+            sys.path.insert(0, SHARED_DIR)
+        import generate_flashcards as mod
+        _SHARED = mod
+    return _SHARED
 
 
 def _dot(a, b) -> float:
     """Dot product; embeddings are normalized, so this is cosine similarity."""
     return float(sum(x * y for x, y in zip(a, b)))
-
-
-def _norm(text: str) -> str:
-    """Lowercase, collapse everything that is not alphanumeric into single spaces."""
-    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
-
-
-def _quote_is_grounded(quote: str, chunk_norm: str, threshold: float = 0.85) -> bool:
-    """Is this quote actually in the source text?
-
-    The prompt asks for a verbatim copy and models still paraphrase or invent
-    quotes outright. An invented quote is the tell for parametric leakage: the
-    model wrote a plausible sentence and attributed it to the document.
-    """
-    quote_norm = _norm(quote)
-    if len(quote_norm) < 12:
-        return False
-    if quote_norm in chunk_norm:
-        return True
-    quote_words = quote_norm.split()
-    chunk_words = set(chunk_norm.split())
-    if not quote_words:
-        return False
-    coverage = sum(1 for w in quote_words if w in chunk_words) / len(quote_words)
-    return coverage >= threshold
-
-
-def _answer_numbers_grounded(answer: str, chunk_norm: str) -> bool:
-    """Every number in the answer must appear in the source text.
-
-    Dates and figures are the highest-value hallucination: a model that invents
-    "1974" when the text says "1973" passes every other check.
-    """
-    for token in re.findall(r"\d[\d.,]*", answer):
-        token = token.rstrip(".,")
-        if token and token not in chunk_norm:
-            return False
-    return True
-
-
-STOPWORDS = frozenset("""
-about above after again also although among any are because been before being
-below between both but can could did does doing down during each either few for
-from further had has have having here how into its itself just more most much
-not now off once only other our out over own same she should some such than that
-the their them then there these they this those through too under until very was
-were what when where which while who whom why will with would you your
-""".split())
-
-# Floor for gross answer/quote mismatch. Kept low on purpose: audit_cards.py
-# shows real answers cluster near 0.9, so a high cut-off only loses good cards.
-ANSWER_QUOTE_MIN_COVERAGE = float(os.environ.get("ANSWER_QUOTE_MIN_COVERAGE", "0.50"))
-
-
-def _content_words(text: str) -> list[str]:
-    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
-            if len(w) > 2 and w not in STOPWORDS]
-
-
-def _capitalized_tokens(text: str):
-    """Capitalised words that are not merely capitalised for sentence position."""
-    for match in re.finditer(r"[A-Za-z][A-Za-z'\u2019\-]*", text or ""):
-        word = match.group(0)
-        if not word[0].isupper():
-            continue
-        before = (text[:match.start()] or "").rstrip()
-        if not before or before[-1] in ".:;!?-\n(\"\u201c'":
-            continue
-        yield word
-
-
-def _ungrounded_names(answer: str, quote: str) -> list[str]:
-    """Names in the answer that its own quote never mentions.
-
-    ADVISORY ONLY - reported, never used to drop a card. Capitalisation is a
-    weak proxy for "named entity": it misfires on abbreviations, on adjectives
-    derived from names ("Nigerian" vs "Nigeria"), and on sentences the model
-    starts mid-string. The enforcing gates are the verbatim-quote check and the
-    number check.
-    """
-    quote_norm = _norm(quote)
-    quote_words = set(_content_words(quote))
-    missing = []
-    for word in _capitalized_tokens(answer):
-        lower = word.lower()
-        if len(lower) < 3 or lower in STOPWORDS:
-            continue
-        if lower in quote_norm:
-            continue
-        # "Nigerian" should count as covered by "Nigeria".
-        if len(lower) >= 5 and any(w.startswith(lower[:5]) for w in quote_words
-                                   if len(w) >= 5):
-            continue
-        missing.append(word)
-    return missing
-
-
-def _answer_coverage(answer: str, quote: str) -> float:
-    answer_words = _content_words(answer)
-    if not answer_words:
-        return 1.0
-    quote_words = set(_content_words(quote))
-    if not quote_words:
-        return 0.0
-    return sum(1 for w in answer_words if w in quote_words) / len(answer_words)
-
-
-def _clean_cards(items, chunk: str = "") -> tuple[list[dict], int]:
-    """Normalise the model's cards and drop anything not grounded in `chunk`.
-
-    Two gates, both cheap:
-      1. no source_quote at all -> dropped (the model asserted something it
-         cannot point at).
-      2. source_quote not found in the chunk, or a number in the answer that
-         the chunk never mentions -> dropped (parametric leakage: the model
-         used its own knowledge instead of the document).
-
-    Pass chunk="" to skip gate 2 (only when the source text is unavailable).
-    Returns (cards, dropped).
-    """
-    chunk_norm = _norm(chunk) if chunk else ""
-    cards: list[dict] = []
-    dropped_ungrounded = 0
-    dropped_leaky = 0
-    dropped_drifted = 0
-    flagged_names = 0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        question = str(item.get("question", "")).strip()
-        answer = str(item.get("answer", "")).strip()
-        quote = str(item.get("source_quote", "")).strip()
-        difficulty = str(item.get("difficulty", "")).strip().lower()
-        if difficulty not in ("easy", "medium", "hard"):
-            difficulty = "medium"
-        if not (question and answer):
-            continue
-        if not quote:
-            dropped_ungrounded += 1
-            continue
-        if chunk_norm and not _quote_is_grounded(quote, chunk_norm):
-            dropped_leaky += 1
-            continue
-        if chunk_norm and not _answer_numbers_grounded(answer, chunk_norm):
-            dropped_leaky += 1
-            continue
-        if chunk_norm:
-            # Reported, never enforced - see _ungrounded_names().
-            names = _ungrounded_names(answer, quote)
-            if names:
-                flagged_names += 1
-        # Short answers cannot drift far; only judge once there is enough of an
-        # answer to be worth judging.
-        if (len(_content_words(answer)) > 6
-                and _answer_coverage(answer, quote) < ANSWER_QUOTE_MIN_COVERAGE):
-            dropped_drifted += 1
-            continue
-        cards.append({
-            "question": question,
-            "answer": answer,
-            "source_quote": quote,
-            "difficulty": difficulty,
-        })
-    if dropped_ungrounded:
-        print(f"dropped {dropped_ungrounded} card(s) with no source_quote")
-    if dropped_leaky:
-        print(f"dropped {dropped_leaky} card(s) whose quote/numbers/names are not in the source")
-    if dropped_drifted:
-        print(f"dropped {dropped_drifted} card(s) whose answer drifts beyond its quote")
-    if flagged_names:
-        print(f"advisory: {flagged_names} card(s) mention a name absent from their quote "
-              f"(kept - review manually)")
-    return cards, dropped_ungrounded + dropped_leaky + dropped_drifted
 
 
 def _job_access(job_id: str):
@@ -493,8 +291,9 @@ class FlashcardLLM:
         except ImportError:
             from piper import PiperVoice                # piper-tts 1.3.x+
 
-        onnx_file, config_file = _voice_paths(TTS_VOICE)
-        print(f"Loading Piper voice {TTS_VOICE} (first TTS request)")
+        voice_name = _tts_voice()
+        onnx_file, config_file = _voice_paths(voice_name)
+        print(f"Loading Piper voice {voice_name} (first TTS request)")
         self._voice = PiperVoice.load(
             hf_hub_download(TTS_VOICE_REPO, onnx_file),
             config_path=hf_hub_download(TTS_VOICE_REPO, config_file),
@@ -652,25 +451,31 @@ class FlashcardLLM:
         from vllm import SamplingParams
         from vllm.sampling_params import GuidedDecodingParams
 
+        shared = _shared()
         sampling = SamplingParams(
             temperature=0.1,
             # Headroom: a 40-card response with question+answer+quote+difficulty is
             # ~3.5-4k tokens. At 4000 the response was cut off mid-string, which
             # (despite guided decoding) yields unparseable JSON.
             max_tokens=7000,
-            guided_decoding=GuidedDecodingParams(json=_flashcard_schema()),
+            # require_quote only forces the KEY to be emitted (xgrammar is happier
+            # without optional properties); the prompt lets the value stay empty,
+            # because a mandatory sentence per card is what capped answers at ~23
+            # words.
+            guided_decoding=GuidedDecodingParams(json=shared.card_schema(require_quote=True)),
         )
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": shared.prompt_text("card_qwen")},
             {"role": "user", "content": f"Text:\n\n{chunk}"},
         ]
         outputs = self.llm.chat(messages, sampling, use_tqdm=False)
 
-        items, truncated = _parse_cards(outputs[0].outputs[0].text)
-        if truncated:
-            print(f"response hit the token limit - salvaged {len(items)} card(s)")
+        raw = outputs[0].outputs[0].text
+        items = shared.parse_cards(raw)
+        if len(raw) >= 7000:
+            print(f"response may have hit the token limit - kept {len(items)} card(s)")
 
-        cards, _dropped = _clean_cards(items, chunk)
+        cards, _dropped = shared.clean_cards(items, chunk)
         return cards
 
     def _dedup(self, cards: list[dict]) -> list[dict]:
@@ -805,7 +610,7 @@ def diagnose() -> None:
             from piper.voice import PiperVoice        # piper-tts 1.2.x
         except ImportError:
             from piper import PiperVoice              # piper-tts 1.3.x+
-        onnx_file, config_file = _voice_paths(TTS_VOICE)
+        onnx_file, config_file = _voice_paths(_tts_voice())
         voice = PiperVoice.load(
             hf_hub_download(TTS_VOICE_REPO, onnx_file),
             config_path=hf_hub_download(TTS_VOICE_REPO, config_file),

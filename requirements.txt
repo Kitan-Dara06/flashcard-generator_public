@@ -6,3 +6,5 @@ upstash-redis>=1.0.0
 redis>=5.0.0
 modal>=0.67.0
 google-genai>=1.0.0
+# Prompts live in api/prompts/*.yaml and are shared with the Modal worker.
+pyyaml>=6.0

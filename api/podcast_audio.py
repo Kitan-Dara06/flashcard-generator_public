@@ -4,8 +4,13 @@
 import io
 import json
 import os
+import sys
 import wave
 from http.server import BaseHTTPRequestHandler
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from generate_flashcards import json_response, resolve_cors_headers
 
 TTS_MODEL = os.environ.get("PODCAST_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 
@@ -27,11 +32,23 @@ def pcm_to_wav(pcm: bytes, rate: int, channels: int = 1, sampwidth: int = 2) -> 
 
 
 def synthesize(dialogue: str):
-    """Returns (wav_bytes, duration_seconds)."""
+    """Returns (wav_bytes, duration_seconds).
+
+    Audio generation cannot go through Zen: it proxies text models only, and
+    multi-speaker TTS needs the Gemini API directly. A missing key is therefore
+    reported as a clear 503 rather than a KeyError traceback.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Podcast audio needs the Gemini API "
+            "directly - the Zen proxy serves text models only."
+        )
+
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=api_key)
     speech = types.SpeechConfig(
         multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
             speaker_voice_configs=[
@@ -67,31 +84,33 @@ def synthesize(dialogue: str):
     return wav, duration
 
 
-def _json(status, payload):
-    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
-
-
 def lambda_handler(event):
     try:
         if event["httpMethod"] != "POST":
-            return _json(405, {"success": False, "error": "Method not allowed"})
+            return json_response(405, {"success": False, "error": "Method not allowed"})
 
         try:
             body = json.loads(event["body"])
             dialogue = str(body.get("dialogue", "")).strip()
         except (TypeError, ValueError):
-            return _json(400, {"success": False, "error": "Malformed request body"})
+            return json_response(400, {"success": False, "error": "Malformed request body"})
 
         if not dialogue:
-            return _json(400, {"success": False, "error": "Missing dialogue"})
+            return json_response(400, {"success": False, "error": "Missing dialogue"})
         if len(dialogue) > 6000:
-            return _json(400, {"success": False, "error": "Dialogue too long"})
+            return json_response(400, {"success": False, "error": "Dialogue too long"})
 
         try:
             wav, duration = synthesize(dialogue)
         except Exception as exc:
             print("TTS failed:", repr(exc))
-            return _json(502, {"success": False, "error": "TTS failed", "details": str(exc)})
+            message = str(exc)
+            if "GEMINI_API_KEY" in message:
+                return json_response(503, {"success": False,
+                                           "error": "Podcast audio is not configured",
+                                           "details": message})
+            return json_response(502, {"success": False, "error": "TTS failed",
+                                       "details": message})
 
         return {
             "statusCode": 200,
@@ -107,7 +126,7 @@ def lambda_handler(event):
         import traceback
         print("Unhandled error:", str(e))
         print(traceback.format_exc())
-        return _json(500, {"success": False, "error": str(e)})
+        return json_response(500, {"success": False, "error": str(e)})
 
 
 class handler(BaseHTTPRequestHandler):
@@ -126,7 +145,9 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8")
-        response = lambda_handler({"httpMethod": "POST", "headers": dict(self.headers), "body": body})
+        event = {"httpMethod": "POST", "headers": dict(self.headers), "body": body}
+        response = lambda_handler(event)
+        response.setdefault("headers", {}).update(resolve_cors_headers(event))
         self._send(response)
 
     def do_OPTIONS(self):

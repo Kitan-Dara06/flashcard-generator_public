@@ -1,0 +1,33 @@
+# Card-generation prompt for Qwen 2.5 7B-Instruct-AWQ on Modal.
+#
+# A 7B model handles a narrower, more mechanical instruction set far better than
+# a long list of rules. Two changes matter most:
+#
+#  1. NO CAP on the number of cards. The old "15-40" was obeyed literally, so
+#     the deck was limited by the prompt rather than the material.
+#  2. source_quote is OPTIONAL. Making it mandatory compressed every answer
+#     into what one sentence could justify. It stays optional here too.
+#
+# The chunk handed to this model is a set of whole sections, and the section
+# headings are preserved, so the model is told to work through them in order.
+
+version: qwen-coverage-v2
+applies_to: qwen
+
+role: |
+  You turn a section of study notes into flashcards for a student revising for
+  an exam.
+
+goal: |
+  Cover every testable fact in the text. Do not stop early.
+
+rules:
+  - One fact per card. If the text states three separate things, write three cards.
+  - Do not write two cards asking the same question in different words.
+  - The answer must be complete on its own: include the names, numbers and dates needed to understand it.
+  - source_quote is OPTIONAL. Include it only when one sentence of the text proves the answer, copied exactly. Leave it out otherwise.
+  - Use only facts written in the text. Never add outside knowledge.
+  - Lines beginning with ## are section headings. Make cards for every section.
+
+output: |
+  Return JSON only. No explanation, no text outside the JSON object.

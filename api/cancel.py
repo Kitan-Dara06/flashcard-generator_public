@@ -1,152 +1,73 @@
 # api/cancel.py
-# Sets a cancel flag the Modal worker checks between chunks, so abandoned
-# jobs stop burning GPU quickly.
-import hashlib
-import hmac
+# Sets a cancel flag that BOTH engines honour: the Modal worker checks it between
+# chunks, and /api/generate_flashcards checks it before each section group, so an
+# abandoned job stops burning GPU and API credit quickly.
 import json
 import os
-import time
+import sys
 from http.server import BaseHTTPRequestHandler
 
-JOB_TTL_SECONDS = 24 * 60 * 60
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-
-# ----- Auth -----
-def auth_secret():
-    """Secret used to sign auth tokens (falls back to APP_PASSWORD)."""
-    return os.environ.get("AUTH_SECRET") or os.environ.get("APP_PASSWORD", "")
-
-
-def validate_auth_token(event):
-    # Auth disabled: single-user app, no accounts. Endpoints are public.
-    return True
-
-
-# ----- CORS -----
-def resolve_cors_headers(event):
-    """CORS headers for origins listed in ALLOWED_ORIGINS only.
-
-    Same-origin requests don't need CORS headers, so leaving ALLOWED_ORIGINS
-    unset keeps the app working while blocking other sites from reading the API.
-    """
-    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
-    origin = headers.get("origin")
-    if not origin:
-        return {}
-    allowed = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-    if origin in allowed:
-        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
-    return {}
-
-
-_REDIS_CLIENT = None
-
-
-def redis_client():
-    """Redis client.
-
-    Credentials are resolved in this order:
-      1. REDIS_URL - a full connection string, e.g.
-         rediss://default:<password>@<host>:<port>/0?ssl_cert_reqs=required
-      2. composed from UPSTASH_HOST + UPSTASH_PASSWORD (+ UPSTASH_PORT, default
-         6379) - the fields the Upstash dashboard shows
-      3. the Upstash REST pair (UPSTASH_REDIS_REST_URL + _TOKEN), which needs no
-         TCP connection and is the leanest option for serverless
-
-    Writers and readers must use the same transport (the clients encode values
-    differently), so keep both sides on the same choice.
-    """
-    global _REDIS_CLIENT
-    if _REDIS_CLIENT is not None:
-        return _REDIS_CLIENT
-
-    url = os.environ.get("REDIS_URL")
-    if not url:
-        host = os.environ.get("UPSTASH_HOST") or os.environ.get("UPSTASH_ENDPOINT")
-        password = os.environ.get("UPSTASH_PASSWORD")
-        if host and password:
-            from urllib.parse import quote
-            port = os.environ.get("UPSTASH_PORT") or "6379"
-            url = (f"rediss://default:{quote(password, safe='')}@{host}:{port}/0"
-                   f"?ssl_cert_reqs=required")
-
-    if url:
-        import redis
-        _REDIS_CLIENT = redis.from_url(url, decode_responses=True)
-    else:
-        from upstash_redis import Redis
-        _REDIS_CLIENT = Redis(
-            url=os.environ["UPSTASH_REDIS_REST_URL"],
-            token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
-        )
-    return _REDIS_CLIENT
+from generate_flashcards import (
+    JOB_TTL_SECONDS,
+    json_response,
+    redis_client,
+    resolve_cors_headers,
+    validate_auth_token,
+)
 
 
 def lambda_handler(event):
     try:
         if event["httpMethod"] != "POST":
-            return {
-                "statusCode": 405,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"success": False, "error": "Method not allowed"})
-            }
+            return json_response(405, {"success": False, "error": "Method not allowed"})
 
         if not validate_auth_token(event):
-            return {
-                "statusCode": 401,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"success": False, "error": "Unauthorized. Please enter the password again."})
-            }
+            return json_response(401, {"success": False, "error": "Unauthorized"})
 
         try:
             body = json.loads(event["body"])
-            job_id = str(body["job_id"])
+            job_id = str(body["job_id"]).strip()
             if not job_id:
                 raise KeyError("job_id")
-        except (KeyError, TypeError, ValueError):
-            return {
-                "statusCode": 400,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"success": False, "error": "Missing job_id"})
-            }
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return json_response(400, {"success": False, "error": "Missing job_id"})
 
         r = redis_client()
         r.set(f"job:{job_id}:cancelled", "1", ex=JOB_TTL_SECONDS)
+        # Mirror it into status so a client that is polling sees the job stop
+        # instead of watching progress freeze.
+        if r.get(f"job:{job_id}:status") in ("queued", "processing"):
+            r.set(f"job:{job_id}:status", "cancelled", ex=JOB_TTL_SECONDS)
 
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"success": True})
-        }
+        return json_response(200, {"success": True})
 
     except Exception as e:
         import traceback
         print("Unhandled error:", str(e))
         print(traceback.format_exc())
-        return {
-            "statusCode": 500,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"success": False, "error": str(e)})
-        }
+        return json_response(500, {"success": False, "error": str(e)})
 
 
 # ----- Vercel entrypoint -----
 class handler(BaseHTTPRequestHandler):
     def _send(self, response):
+        body = response["body"]
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.send_response(response["statusCode"])
         for k, v in response.get("headers", {}).items():
             self.send_header(k, v)
+        if "Content-Length" not in response.get("headers", {}):
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(response["body"].encode())
+        self.wfile.write(body)
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8")
-        event = {
-            "httpMethod": "POST",
-            "headers": dict(self.headers),
-            "body": body
-        }
+        event = {"httpMethod": "POST", "headers": dict(self.headers), "body": body}
         response = lambda_handler(event)
         response.setdefault("headers", {}).update(resolve_cors_headers(event))
         self._send(response)

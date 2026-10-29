@@ -1,0 +1,34 @@
+# Card-generation prompt for Gemini (and any frontier model).
+#
+# Design notes:
+#  * Coverage, not brevity. A fixed "15-40 cards" cap was the single biggest
+#    reason decks were thin: the model obeyed the cap instead of the content.
+#  * source_quote is OPTIONAL. When it was mandatory, the model compressed every
+#    answer into something one sentence could justify, which capped answer depth
+#    at ~23 words. Optional quotes keep the verification anchor for most cards
+#    while letting answers be complete.
+#  * Section markers (## Heading) come from the document's own structure, so
+#    "cover every section" is a checkable instruction.
+
+version: coverage-v3
+applies_to: gemini
+
+role: |
+  You are building a complete study deck from the document below.
+
+goal: |
+  COVERAGE. A student using this deck must be able to answer an exam question
+  about any fact in the document. Miss nothing.
+
+rules:
+  - Enumerate EVERY distinct testable fact: definitions, dates, figures, named people and organisations, purposes, objectives, procedures, requirements, outcomes, comparisons, and list items. If a section contains 60 testable facts, produce 60 cards.
+  - Do not stop early and do not summarise. Do not merge separate facts into one card - if the text states three things, that is three cards.
+  - Do not pad with restatements of the same fact in different words.
+  - The answer must be self-contained: a student who has not read the document should understand it. Include the specific names, numbers, dates and context. Use two or three sentences when the fact has parts.
+  - source_quote is OPTIONAL. Include it when one specific sentence from the text proves the answer, copied character-for-character. Omit it otherwise. Never invent or paraphrase a quote.
+  - The answer may elaborate using other parts of the SAME document. Every fact in it must still come from this document - never from your own knowledge.
+  - Lines beginning with ## mark a document section. Cover every section.
+  - Rate difficulty as easy, medium or hard.
+
+output: |
+  Return JSON only. Do not explain, apologise, or return any text outside the JSON object.

@@ -152,7 +152,9 @@ def main():
     parser.add_argument("--cancel-after", type=int, default=0,
                         help="cancel the job this many seconds after submitting (0 = never)")
     parser.add_argument("--provider", choices=["qwen", "gemini"], default=None,
-                        help="force an engine (default: let the server pick; gemini exercises the fallback)")
+                        help="force an engine (default: let the server pick)")
+    parser.add_argument("--chunk-timeout", type=float, default=180,
+                        help="timeout for one Gemini section-group request")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -215,7 +217,29 @@ def main():
     if not body.get("job_id"):
         fail(f"unexpected submit response ({status})", body)
     job_id = body["job_id"]
-    log("submit", f"queued job {job_id[:8]} in {time.time() - t_submit:.1f}s")
+    total_chunks = body.get("chunks") or 0
+    log("submit", f"queued job {job_id[:8]} in {time.time() - t_submit:.1f}s"
+        + (f" - {total_chunks} section group(s)" if total_chunks else ""))
+
+    # 2b. The API engines are driven one section group at a time (each request
+    # stays inside the serverless time limit). The app does this from the browser;
+    # the test has to do it too or the job never progresses.
+    if total_chunks:
+        for i in range(total_chunks):
+            c_status, c_body = request_json(f"{base}/api/generate_flashcards", token,
+                                            payload={"job_id": job_id, "chunk": i},
+                                            timeout=args.chunk_timeout)
+            if isinstance(c_body, dict) and (c_body.get("quota") or c_body.get("unavailable")):
+                log("engine", "API engines unavailable - falling back to Modal")
+                request_json(f"{base}/api/generate_flashcards", token,
+                             payload={"job_id": job_id, "provider": "qwen"})
+                break
+            if c_status != 200:
+                fail(f"section group {i + 1}/{total_chunks} failed ({c_status})", c_body)
+            log("chunk", f"{i + 1}/{total_chunks} done "
+                f"({time.time() - t_submit:.0f}s) - {c_body.get('cards', '?')} card(s)")
+            if c_body.get("final"):
+                break
 
     # 3. poll
     last_progress = None

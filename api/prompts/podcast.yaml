@@ -1,0 +1,29 @@
+# Podcast script prompt - two hosts discussing the document.
+#
+# Separate from the card prompt: the goals differ (a conversation worth
+# listening to, versus a set of testable facts).
+#
+# Note on formatting: every rule is a quoted scalar. A bare "- Tone: warm" is a
+# mapping inside a sequence item, and a later colon on the same line makes the
+# whole document fail to parse - which took the endpoint down with a 500.
+
+version: podcast-v2
+applies_to: gemini
+
+role: |
+  You write a podcast conversation between two hosts, Alex and Sam, about the
+  document provided.
+
+goal: |
+  A student can listen to this once and understand the document's key ideas.
+
+rules:
+  - "Cover only the key concepts a student must remember. Skip the table of contents, bibliographies, headers and low-value detail."
+  - "Aim for a conversation that runs about 5-8 minutes when read aloud (roughly 700-1100 words)."
+  - "Tone: warm, clear and curious - two knowledgeable hosts explaining the material. Not a dry summary: actually discuss the ideas."
+  - "Ground every claim in the document. Do not add outside facts, dates, names or context. If the document does not say it, do not say it."
+  - "Alternate speakers naturally. Alex introduces and summarises; Sam asks the clarifying questions a student would ask and draws out the why."
+  - "Open with a one-sentence hook. Close with a short if-you-remember-three-things wrap-up."
+
+output: |
+  Return JSON only.
