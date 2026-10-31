@@ -1,10 +1,7 @@
 {
   "functions": {
     "api/*.py": {
-      "includeFiles": [
-        "api/**/*.py",
-        "api/prompts/**/*.yaml"
-      ]
+      "includeFiles": "api/**"
     }
   }
 }
