@@ -16,7 +16,6 @@ Before deploying:
 """
 import json
 import os
-import re
 import struct
 import sys
 
@@ -35,12 +34,7 @@ PROMPT_DIR = "/root/prompts"
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
-MAX_CHUNK_CHARS = 24_000        # ~6k tokens per chunk
-MIN_CHUNK_CHARS = 6_000         # gather at least this much before honouring a topic break
-MAX_CHUNKS = 8                  # ceiling on LLM calls per document (raises min size if needed)
-SIM_BOUNDARY_THRESHOLD = 0.5    # adjacent-block similarity below this: topic boundary
 DEDUP_THRESHOLD = 0.92          # question similarity above this: duplicate card
-REDIS_TTL_SECONDS = 24 * 60 * 60
 
 # Text-to-speech (Piper, runs on CPU in this same container)
 TTS_VOICE_REPO = "rhasspy/piper-voices"
@@ -122,19 +116,6 @@ def _shared():
 def _dot(a, b) -> float:
     """Dot product; embeddings are normalized, so this is cosine similarity."""
     return float(sum(x * y for x, y in zip(a, b)))
-
-
-def _job_access(job_id: str):
-    """Redis client plus the job-scoped key/write helpers both workers use."""
-    r = _redis_client()
-
-    def key(suffix: str) -> str:
-        return f"job:{job_id}:{suffix}"
-
-    def write(suffix: str, value: str) -> None:
-        r.set(key(suffix), value, ex=REDIS_TTL_SECONDS)
-
-    return r, key, write
 
 
 def _redis_url() -> str | None:
@@ -329,7 +310,7 @@ class FlashcardLLM:
                 "--force upstash REDIS_URL=..."
             )
 
-        r, key, write = _job_access(job_id)
+        r, key, write = _shared().job_access(job_id)
 
         try:
             # Cheap fix for abandoned jobs: the cancel flag is honoured before
@@ -348,45 +329,63 @@ class FlashcardLLM:
             if not text:
                 raise ValueError("Job data expired or missing")
 
-            chunks = self._semantic_chunks(text)
-            write("progress", f"0/{len(chunks)}")
+            # section_chunks from the shared module, deliberately not the worker's
+            # own chunking: the fallback must produce the same indices the API path
+            # wrote, or it cannot skip what is already stored.
+            shared = _shared()
+            chunks = shared.section_chunks(text)
+            total = len(chunks)
+            write("total_chunks", str(total))
 
-            cards: list[dict] = []
+            # Same helper the API path uses, so the two cannot disagree about what
+            # "already stored" means.
+            done = shared.stored_chunks(r, key, total)
+            if done:
+                print(f"job {job_id}: {len(done)}/{total} chunk(s) already stored, "
+                      f"generating the remaining {total - len(done)}")
+            write("progress", f"{len(done)}/{total}")
+
             failed_chunks = 0
-            for i, chunk in enumerate(chunks, 1):
+            for i, chunk in enumerate(chunks):
                 if r.get(key("cancelled")) == "1":
                     write("status", "cancelled")
                     return
+                if i in done:
+                    continue
                 try:
                     batch = self._generate_cards(chunk)
                 except Exception as exc:
-                    # One bad chunk must not sink the whole document: log it, score
-                    # it as empty, and keep going.
+                    # One bad chunk must not sink the whole document: log it,
+                    # score it as empty, and keep going. It is still written, so
+                    # "done" means "attempted" and the job can finish.
                     failed_chunks += 1
-                    print(f"chunk {i}/{len(chunks)} failed: {type(exc).__name__}: {exc}")
+                    print(f"chunk {i + 1}/{total} failed: {type(exc).__name__}: {exc}")
                     batch = []
+                write(f"chunk:{i}", json.dumps(batch))
+                done[i] = batch
                 # Per-chunk count: makes a chunk that yielded nothing (all cards
                 # dropped as ungrounded) visible in the log.
-                print(f"chunk {i}/{len(chunks)}: {len(batch)} card(s)")
-                cards.extend(batch)
-                write("progress", f"{i}/{len(chunks)}")
+                print(f"chunk {i + 1}/{total}: {len(batch)} card(s)")
+                write("progress", f"{len(done)}/{total}")
+                write("partial_cards", str(sum(len(v) for v in done.values())))
+
+            cards: list[dict] = []
+            for i in range(total):
+                cards.extend(done.get(i) or [])
+            cards = self._dedup(cards)
 
             if not cards:
                 raise ValueError(
                     f"No flashcards could be generated from this document "
-                    f"({failed_chunks}/{len(chunks)} chunk(s) failed)."
+                    f"({failed_chunks}/{total} chunk(s) failed)."
                 )
 
-            cards = self._dedup(cards)
-            if cards:
-                # Shape check: catches any drift between what the model returns,
-                # what the filter keeps, and what the UI expects to render.
-                first = cards[0]
-                quoted = sum(1 for c in cards if (c.get("source_quote") or "").strip())
-                print(
-                    f"writing {len(cards)} card(s) to redis; "
-                    f"keys={sorted(first.keys())} grounded={quoted}/{len(cards)}"
-                )
+            # Shape check: catches any drift between what the model returns, what
+            # the filter keeps, and what the UI expects to render.
+            first = cards[0]
+            quoted = sum(1 for c in cards if (c.get("source_quote") or "").strip())
+            print(f"writing {len(cards)} card(s) to redis; "
+                  f"keys={sorted(first.keys())} grounded={quoted}/{len(cards)}")
             write("cards", json.dumps(cards))
             write("status", "complete")
         except Exception as exc:
@@ -399,54 +398,6 @@ class FlashcardLLM:
             raise
 
     # ----- internals -----
-    def _semantic_chunks(self, text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
-        """Split text into ~max_chars chunks that respect topic boundaries.
-
-        Blocks (paragraphs) are embedded with bge-small; a chunk boundary is
-        placed wherever adjacent-block similarity drops below
-        SIM_BOUNDARY_THRESHOLD, or whenever adding a block would exceed
-        max_chars.
-        """
-        blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
-        if len(blocks) <= 1:
-            blocks = [b.strip() for b in text.split("\n") if b.strip()]
-
-        # hard-split any single block that alone exceeds the budget
-        sized: list[str] = []
-        for block in blocks:
-            while len(block) > max_chars:
-                sized.append(block[:max_chars])
-                block = block[max_chars:]
-            if block:
-                sized.append(block)
-
-        if len(sized) <= 1:
-            return sized or [text]
-
-        embeddings = list(self.embedder.encode(sized, normalize_embeddings=True))
-
-        chunks: list[str] = []
-        current = [sized[0]]
-        current_len = len(sized[0])
-        # Bound the number of LLM calls: for a long document, require more text
-        # per chunk so a report with many short sections can't turn into a
-        # dozen-plus generations.
-        min_chars = max(MIN_CHUNK_CHARS, len(text) // MAX_CHUNKS)
-        for i in range(1, len(sized)):
-            similarity = _dot(embeddings[i - 1], embeddings[i])
-            block_len = len(sized[i])
-            # Only honour a topic break once enough text has accumulated.
-            topic_break = (similarity < SIM_BOUNDARY_THRESHOLD
-                           and current_len >= min_chars)
-            if topic_break or current_len + block_len + 2 > max_chars:
-                chunks.append("\n\n".join(current))
-                current, current_len = [sized[i]], block_len
-            else:
-                current.append(sized[i])
-                current_len += block_len + 2
-        chunks.append("\n\n".join(current))
-        return chunks
-
     def _generate_cards(self, chunk: str) -> list[dict]:
         from vllm import SamplingParams
         from vllm.sampling_params import GuidedDecodingParams

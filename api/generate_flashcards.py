@@ -43,6 +43,10 @@ ZEN_BASE_URL = os.environ.get(
     "OPENCODE_BASE_URL", "https://opencode.ai/inference/google/v1beta").rstrip("/")
 ZEN_MODEL = os.environ.get("ZEN_MODEL", "gemini-3.5-flash-lite")
 ZEN_TIMEOUT_SECONDS = int(os.environ.get("ZEN_TIMEOUT_SECONDS", "55"))
+# Cloudflare sits in front of Zen and rejects urllib's default User-Agent with a
+# 403 ("error code: 1010") - verified: a bare request is blocked, any explicit UA
+# is accepted, so this only has to be honest and non-empty.
+ZEN_USER_AGENT = os.environ.get("ZEN_USER_AGENT", "flashcard-generator/1.0")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MAX_OUTPUT = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "65535"))
@@ -134,7 +138,11 @@ def redis_client():
 
 
 def job_access(job_id, ttl=JOB_TTL_SECONDS):
-    """Return (client, key, write) for a job's Redis keys."""
+    """Return (client, key, write) for a job's Redis keys.
+
+    Both engines use this, so a job's bookkeeping is identical whichever produced
+    it - including `updated`, which /api/status uses to notice an abandoned job.
+    """
     r = redis_client()
 
     def key(suffix):
@@ -142,6 +150,10 @@ def job_access(job_id, ttl=JOB_TTL_SECONDS):
 
     def write(suffix, value):
         r.set(key(suffix), value, ex=ttl)
+        # Externally visible touch. Bookkeeping keys are excluded so stamping
+        # cannot extend a job's own TTL or feed back into the idle clock.
+        if suffix not in ("updated", "text", "created", "total_chunks"):
+            r.set(key("updated"), str(int(time.time())), ex=ttl)
 
     return r, key, write
 
@@ -340,11 +352,49 @@ def extract_text(file_content, file_type):
 # =====================================================================
 # Chunking
 # =====================================================================
-# ~20k chars is ~5k input tokens, keeping one request well inside Vercel's 60 s
-# limit (measured ~30-35 s at this size). Bigger chunks are fewer requests but
-# risk the timeout, and with Zen there is no daily request cap to trade against.
-CHUNK_CHARS = int(os.environ.get("GEMINI_CHUNK_CHARS", "20000"))
-MAX_CHUNKS = 8      # ceiling on LLM calls per document
+# Measured on the SIWES report (19,740-char section, same model and prompt):
+#   20k chars/call -> 26 cards (1.32 per 1,000 chars)
+#    6.6k chars/call -> 69 cards (3.50)
+#    3.9k chars/call -> 82 cards (4.15)
+# The model stops being exhaustive long before it runs out of context: given 20k
+# characters it summarises, given 6k it enumerates. 6k is the knee - the extra
+# 19% from 3.9k costs ~35% more sequential latency, and each call is its own
+# function invocation.
+CHUNK_CHARS = int(os.environ.get("GEMINI_CHUNK_CHARS", "6000"))
+# A ceiling, not a target. It used to be 8, then 20: because section_chunks()
+# raises its budget to ceil(len(text) / max_chunks), a low ceiling silently made
+# chunks grow past the 6k knee - a 500k-character document got 25k chunks and
+# went back to summarising. 100 keeps the budget at CHUNK_CHARS for every
+# document up to MAX_TEXT_CHARS (100 * 6,000 = 600,000 > 500,000), so the ceiling
+# can no longer undo the coverage.
+MAX_CHUNKS = int(os.environ.get("GEMINI_MAX_CHUNKS", "100"))
+
+
+def fold_small(chunks, max_chars, max_chunks):
+    """Merge adjacent chunks to reduce the call count, never past the knee.
+
+    Folding exists for documents with many tiny sections (300 headings of 200
+    chars each should not become 300 calls). It must not become a way to exceed
+    CHUNK_CHARS: merging 5k + 4k into a 9k chunk puts the model back over the
+    size where it summarises instead of enumerates, which is exactly the failure
+    the chunk size was chosen to avoid. When merging would do that, the extra
+    calls are kept and the situation is reported.
+    """
+    while len(chunks) > max_chunks:
+        merged = []
+        for i in range(0, len(chunks), 2):
+            pair = chunks[i:i + 2]
+            if len(pair) == 2 and len(pair[0]) + len(pair[1]) + 2 <= max_chars:
+                merged.append("\n\n".join(pair))
+            else:
+                merged.extend(pair)
+        if len(merged) >= len(chunks):
+            print(f"{len(chunks)} sections exceed the {max_chunks}-call ceiling; "
+                  f"keeping every chunk at <= {max_chars} chars rather than "
+                  f"merging past it")
+            return merged
+        chunks = merged
+    return chunks
 
 
 def section_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
@@ -401,13 +451,8 @@ def section_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
             current_len += len(part) + 2
     flush()
 
-    # Fold neighbours rather than dropping text if the cap is still exceeded.
-    while len(chunks) > max_chunks:
-        merged = []
-        for i in range(0, len(chunks), 2):
-            merged.append("\n\n".join(chunks[i:i + 2]))
-        chunks = merged
-    return chunks
+    # Fold neighbours only where that keeps chunks inside the size budget.
+    return fold_small(chunks, max_chars, max_chunks)
 
 
 def paragraph_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
@@ -448,12 +493,7 @@ def paragraph_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
     if current:
         chunks.append("\n\n".join(current))
 
-    while len(chunks) > max_chunks:
-        merged = []
-        for i in range(0, len(chunks), 2):
-            merged.append("\n\n".join(chunks[i:i + 2]))
-        chunks = merged
-    return chunks
+    return fold_small(chunks, max_chars, max_chunks)
 
 
 # =====================================================================
@@ -800,13 +840,47 @@ def _quota_markers():
             "billing", "exceeded your current quota", "insufficient")
 
 
+# Network-level failures are never the document's fault and always worth another
+# engine: DNS, connection resets and TLS errors arrive as exceptions with no HTTP
+# status at all, which used to fall through to "fatal".
+_NETWORK_MARKERS = ("name resolution", "temporary failure in name", "tunnel", "connection",
+                    "connect", "remotedisconnected", "ssl", "certificate", "eai_",
+                    "getaddrinfo", "network", "timed out", "timeout", "reset by peer",
+                    "proxyerror", "unreadable response", "failed to establish")
+
+
+def _network_error(text):
+    return any(marker in text for marker in _NETWORK_MARKERS)
+
+
 def classify(status, detail):
-    """Map an HTTP status / provider error string onto an EngineFailure kind."""
+    """Map an HTTP status / provider error string onto an EngineFailure kind.
+
+    The messages are what ends up in the job error and in the UI, so they name
+    the actual problem: a 403 from Zen is usually "this model is not enabled for
+    your key", not "your key is wrong", and saying the wrong one sends you
+    hunting for a broken secret that is fine.
+    """
     text = (detail or "").lower()
-    if status in (401, 403):
-        return EngineFailure("fatal", f"rejected the API key ({status}): {detail}")
+    if status == 401:
+        return EngineFailure("fatal", f"API key rejected (401): {detail}")
+    if status == 403:
+        if any(marker in text for marker in
+               ("model access", "disabled", "not enabled", "not available",
+                "unsupported", "permission")):
+            return EngineFailure(
+                "fatal",
+                f"this model is not enabled for the key (403): {detail}. "
+                f"Check which models the account can use, or change ZEN_MODEL.")
+        return EngineFailure("fatal", f"forbidden (403): {detail}")
+    if status == 404:
+        return EngineFailure("fatal",
+                             f"model or endpoint not found (404): {detail}. "
+                             f"Check ZEN_MODEL against the provider's model list.")
     if status == 429 or any(marker in text for marker in _quota_markers()):
         return EngineFailure("quota", f"quota/rate limit ({status}): {detail}")
+    if _network_error(text):
+        return EngineFailure("transient", f"network error reaching the provider: {detail}")
     if status in (408, 500, 502, 503, 504) or any(
             marker in text for marker in
             ("unavailable", "overloaded", "high demand", "deadline exceeded", "timed out")):
@@ -840,6 +914,7 @@ def _zen_post(payload):
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
+            "User-Agent": ZEN_USER_AGENT,
             # Zen authenticates with a bearer token; the Google SDK's own header
             # (x-goog-api-key) is not accepted, which is why this is a plain POST.
             "Authorization": f"Bearer {os.environ['OPENCODE_API_KEY']}",
@@ -923,8 +998,10 @@ JSON_ENGINES = {"zen": zen_json, "gemini": gemini_json}
 def generate_json(prompt, contents, schema, preferred=None, temperature=0.1):
     """One JSON-mode generation through the engine chain.
 
-    Returns (engine_name, raw_text). Raises EngineFailure carrying the LAST
-    failure when no engine worked.
+    Returns (engine_name, raw_text). When no engine worked, raises an EngineFailure
+    whose kind is the most recoverable of the ones seen: "the whole chain failed"
+    is a reason to try the other engine (Modal), not a reason to fail the document.
+    Reporting the last error instead turned a DNS blip into a dead job.
     """
     chain = provider_chain(preferred)
     if not chain:
@@ -933,20 +1010,26 @@ def generate_json(prompt, contents, schema, preferred=None, temperature=0.1):
                             "or GEMINI_API_KEY, or use the Modal worker).")
 
     last = None
+    kinds = []
     for name in chain:
         try:
             raw = JSON_ENGINES[name](prompt, contents, schema, temperature)
         except EngineFailure as exc:
             last = exc
+            kinds.append(exc.kind)
             print(f"engine {name} failed ({exc.kind}): {exc}")
-            if exc.kind == "fatal" and len(chain) == 1:
-                raise
             continue
         except Exception as exc:                 # never let an engine crash the request
             last = EngineFailure("fatal", f"{name}: {type(exc).__name__}: {exc}")
+            kinds.append("fatal")
             print(f"engine {name} crashed: {last}")
             continue
         return name, raw
+
+    if "transient" in kinds:
+        raise EngineFailure("transient", f"every engine failed: {last}")
+    if "quota" in kinds:
+        raise EngineFailure("quota", f"every engine is out of credit: {last}")
     raise last
 
 
@@ -1006,8 +1089,63 @@ def dispatch_to_modal(job_id, r):
 # =====================================================================
 # Chunk handler
 # =====================================================================
+def _get_many(r, keys):
+    """Values for many keys, in ONE call where the client supports it.
+
+    On the Upstash REST transport every GET is a separate HTTPS round trip, so a
+    per-key scan of a 20-chunk job costs ~400 requests before any generation
+    happens. mget collapses that to one; clients without it fall back.
+    """
+    if not keys:
+        return []
+    try:
+        values = r.mget(keys)
+        if isinstance(values, list) and len(values) == len(keys):
+            return values
+    except Exception:
+        pass
+    return [r.get(k) for k in keys]
+
+
+def stored_chunks(r, key, total):
+    """Chunk results already in Redis, as {index: [cards]}.
+
+    A corrupt value is treated as "not done" so a half-written chunk gets
+    regenerated rather than poisoning the merge.
+    """
+    raw_values = _get_many(r, [key(f"chunk:{i}") for i in range(total)])
+    done = {}
+    for index, raw in enumerate(raw_values):
+        if raw is None:
+            continue
+        try:
+            done[index] = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            print(f"ignoring unreadable chunk {index}")
+    return done
+
+
+def merge_and_publish(r, write, key, total, done=None):
+    """Merge every stored chunk, dedup once across the document, publish."""
+    done = stored_chunks(r, key, total) if done is None else done
+    all_cards = []
+    for i in range(total):
+        all_cards.extend(done.get(i) or [])
+    cards = text_dedup(all_cards)
+    write("cards", json.dumps(cards))
+    write("status", "complete")
+    write("note", f"{len(cards)} cards across {total} sections")
+    return cards
+
+
 def run_chunk(job_id, r, key, write, text, index):
-    """Generate ONE section group; finalise the job on the last one."""
+    """Generate ONE section group; finalise once every group is stored.
+
+    Each group's cards go to job:<id>:chunk:<idx> the moment they exist, so a
+    failure at group 18 loses group 18, not 1-17. The write also makes the call
+    idempotent: a group already in Redis is returned as-is instead of being paid
+    for again, which is what makes retry and resume cheap.
+    """
     chunks = section_chunks(text)
     total = len(chunks)
 
@@ -1025,50 +1163,52 @@ def run_chunk(job_id, r, key, write, text, index):
     write("status", "processing")
     write("total_chunks", str(total))
 
-    try:
-        batch, dropped, engine = generate_cards(chunks[index], r.get(key("engine")))
-    except EngineFailure as exc:
-        import traceback
-        print(f"job {job_id} chunk {index} failed ({exc.kind}): {exc}")
-        print(traceback.format_exc())
-        if exc.kind == "quota":
-            return json_response(503, {"success": False, "quota": True,
-                                       "error": f"API quota exhausted: {exc}"})
-        if exc.kind == "transient":
+    done = stored_chunks(r, key, total)
+    reused = index in done
+
+    if reused:
+        batch = done[index]
+        dropped = 0
+        engine = r.get(key("engine")) or ""
+        print(f"job {job_id} chunk {index + 1}/{total}: reusing {len(batch)} stored card(s)")
+    else:
+        try:
+            batch, dropped, engine = generate_cards(chunks[index], r.get(key("engine")))
+        except EngineFailure as exc:
+            import traceback
+            print(f"job {job_id} chunk {index} failed ({exc.kind}): {exc}")
+            print(traceback.format_exc())
+            # Never mark the job errored: the groups that already landed stay in
+            # Redis, and a 503 tells the client to hand the remainder to the Modal
+            # worker, which resumes from exactly these indices. Failing the job
+            # here would discard finished work over one bad API response.
+            if exc.kind == "quota":
+                return json_response(503, {"success": False, "quota": True,
+                                           "fallback": True,
+                                           "error": f"API quota exhausted: {exc}"})
             return json_response(503, {"success": False, "unavailable": True,
+                                       "fallback": True,
                                        "error": f"AI provider unavailable: {exc}"})
-        write("error", str(exc))
-        write("status", "error")
-        return json_response(502, {"success": False,
-                                   "error": "Generation failed. " + str(exc)})
 
-    # Remember the engine that worked so later chunks don't re-pay a failure.
-    write("engine", engine)
-    write("provider", engine)
-    write(f"part:{index}", json.dumps(batch))
-    print(f"job {job_id} chunk {index + 1}/{total}: {len(batch)} card(s), dropped {dropped}")
+        # Remember the engine that worked so later chunks don't re-pay a failure.
+        write("engine", engine)
+        write("provider", engine)
+        write(f"chunk:{index}", json.dumps(batch))
+        done[index] = batch
+        print(f"job {job_id} chunk {index + 1}/{total}: {len(batch)} card(s), dropped {dropped}")
 
-    # Count finished parts rather than trusting a counter: idempotent under
-    # retries, and safe when the client requests chunks in parallel.
-    present = sum(1 for i in range(total) if r.get(key(f"part:{i}")) is not None)
-    write("progress", f"{present}/{total}")
+    write("progress", f"{len(done)}/{total}")
+    write("partial_cards", str(sum(len(v) for v in done.values())))
 
-    if present < total:
-        return json_response(200, {"success": True, "done": present, "total": total,
+    if len(done) < total:
+        return json_response(200, {"success": True, "done": len(done), "total": total,
                                    "cards": len(batch), "final": False,
-                                   "provider": engine})
+                                   "reused": reused, "provider": engine})
 
-    # Last group: merge, dedup once across the document, publish.
-    all_cards = []
-    for i in range(total):
-        all_cards.extend(json.loads(r.get(key(f"part:{i}")) or "[]"))
-    cards = text_dedup(all_cards)
-    write("cards", json.dumps(cards))
-    write("status", "complete")
-    write("note", f"{len(cards)} cards across {total} sections")
+    cards = merge_and_publish(r, write, key, total, done)
     return json_response(200, {"success": True, "done": total, "total": total,
                                "cards": len(cards), "final": True,
-                               "provider": engine})
+                               "reused": reused, "provider": engine})
 
 
 # =====================================================================

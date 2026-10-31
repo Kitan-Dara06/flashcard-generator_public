@@ -2,12 +2,18 @@
  * script and cached audio. Works entirely offline.
  *
  * Exposed as window.Store.
+ *
+ * Audio keys are "<deckId>|<content hash>" so a deck's clips can be cleared when
+ * the deck is deleted; the content hash alone would orphan them permanently.
  */
 (function () {
     'use strict';
 
     const DB_NAME = 'study-decks';
-    const DB_VERSION = 1;
+    // v2: audio keys gained a "<deckId>|" prefix so deleting a deck can clear its
+    // clips. The old bare-hash keys cannot be attributed to any deck, so they are
+    // dropped on upgrade rather than left orphaned forever.
+    const DB_VERSION = 2;
 
     const STORES = {
         decks: 'decks',      // keyPath 'id'
@@ -37,6 +43,9 @@
                         db.createObjectStore(name, { keyPath: name === 'decks' ? 'id' : (name === 'cards' || name === 'podcasts' ? 'deckId' : 'key') });
                     }
                 });
+                if (e.oldVersion < 2) {
+                    e.target.transaction.objectStore('audio').clear();
+                }
             };
             req.onsuccess = function () { resolve(req.result); };
             req.onerror = function () { available = false; reject(req.error); };
@@ -136,6 +145,20 @@
         await del(db, STORES.decks, id);
         await del(db, STORES.cards, id);
         await del(db, STORES.podcasts, id);
+        // Audio is the biggest store by far (a single segment is ~180 KB) and is
+        // keyed by "<deckId>|<hash>", so a deck's clips are reachable by prefix.
+        // Without this, deleting a deck leaves its audio orphaned forever.
+        await deleteAudioForDeck(db, id);
+    }
+
+    async function deleteAudioForDeck(db, deckId) {
+        const prefix = deckId + "|";
+        const all = await getAll(db, STORES.audio);
+        for (const entry of all) {
+            if (typeof entry.key === "string" && entry.key.indexOf(prefix) === 0) {
+                await del(db, STORES.audio, entry.key);
+            }
+        }
     }
 
     // ----- podcast (phase 3) -----

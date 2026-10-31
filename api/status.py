@@ -22,6 +22,12 @@ from generate_flashcards import (
 # first cold boot (image pull + model load + snapshot).
 QUEUED_STALE_SECONDS = 10 * 60
 
+# A job in "processing" that has not written a chunk for this long was abandoned:
+# the tab closed, or every engine failed and the client stopped asking. Chunk
+# results survive in Redis, so the honest answer is "stale but resumable" rather
+# than pretending it is still running.
+PROCESSING_STALE_SECONDS = int(os.environ.get("PROCESSING_STALE_SECONDS", "600"))
+
 
 def lambda_handler(event):
     try:
@@ -55,6 +61,37 @@ def lambda_handler(event):
             except (TypeError, ValueError):
                 age = None
             payload["age_seconds"] = age
+
+        if status == "processing":
+            # How much of the deck already exists. Each group's cards are in
+            # Redis as they finish, so this survives a reload, a retry or a
+            # hand-off to the Modal worker.
+            try:
+                payload["partial_cards"] = int(r.get(f"job:{job_id}:partial_cards") or 0)
+            except (TypeError, ValueError):
+                payload["partial_cards"] = 0
+            done, _sep, total = (payload["progress"] or "").partition("/")
+            payload["done_chunks"] = int(done) if done.isdigit() else 0
+            payload["total_chunks"] = int(total) if total.isdigit() else 0
+
+            # Abandoned job: nothing has been written for a while. The generated
+            # groups are safe in Redis, so say it is stalled and resumable instead
+            # of reporting a job that will never finish.
+            updated = r.get(f"job:{job_id}:updated")
+            idle = None
+            try:
+                idle = max(0, int(time.time()) - int(updated)) if updated else None
+            except (TypeError, ValueError):
+                idle = None
+            if idle is not None and idle > PROCESSING_STALE_SECONDS:
+                payload["stalled"] = True
+                payload["resumable"] = True
+                payload["fallback_available"] = True
+                payload["error"] = (f"No section group has finished for "
+                                    f"{idle // 60} min. Already-generated groups are "
+                                    f"kept; retrying resumes from the first missing "
+                                    f"one, or the job can be handed to the backup "
+                                    f"engine.")
 
         if status == "queued" and age is not None and age > QUEUED_STALE_SECONDS:
             # The worker never picked the job up. Report it and let the client

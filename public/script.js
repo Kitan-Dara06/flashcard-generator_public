@@ -68,6 +68,10 @@
     // without it the chunk loop kept firing (and kept paying) for minutes, then
     // saved and opened the deck anyway.
     let cancelRequested = false;
+    // Guards the one automatic recovery attempt for a job that went idle (closed
+    // tab, or every engine failed). Already-finished groups are in Redis, so
+    // resuming costs nothing for them.
+    let resumeTried = false;
     let podcast = null;          // { title, turns }
     let podcastSegs = [];        // [{ turns:[idx], url, duration }]
     let podAudio = null;
@@ -137,6 +141,7 @@
             currentJobId = data.job_id;
             fallbackTried = false;
             cancelRequested = false;
+            resumeTried = false;
             // The API answers with a chunk plan: one request per section group.
             if (data.chunks > 0) {
                 await runChunks(currentJobId, data.chunks, file.name);
@@ -152,8 +157,8 @@
 
     // Drive Gemini one section group at a time. Each call is a few tens of
     // seconds - inside the serverless limit - and progress is real.
-    async function runChunks(jobId, total, sourceName) {
-        for (let i = 0; i < total; i++) {
+    async function runChunks(jobId, total, sourceName, startAt) {
+        for (let i = (startAt || 0); i < total; i++) {
             if (cancelRequested) return;
             updateLoadingText('Generating cards… (section group ' + (i + 1) + ' of ' + total + ')');
             setProgress(Math.round((i / total) * 100));
@@ -279,6 +284,24 @@
                     const m = p.match(/^(\d+)\/(\d+)$/);
                     if (m) setProgress(Math.round((parseInt(m[1], 10) / parseInt(m[2], 10)) * 100));
                     updateLoadingText('Generating… (chunk ' + p.replace('/', ' of ') + ')');
+                }
+                // Nothing has landed for a while: the tab was closed mid-job, or an
+                // engine failed and the client gave up. Groups already generated are
+                // in Redis, so continue from the first missing one instead of
+                // reporting a failure and losing the work.
+                if (data.stalled && data.resumable && !resumeTried) {
+                    resumeTried = true;
+                    const totalChunks = Number(data.total_chunks) || 0;
+                    if (totalChunks > 0) {
+                        updateLoadingText('Resuming where it stopped…');
+                        setProgress(-1);
+                        await runChunks(jobId, totalChunks, sourceName,
+                                        Number(data.done_chunks) || 0);
+                        return;
+                    }
+                    hideLoading();
+                    showError(data.error || 'Generation stalled.');
+                    return;
                 }
             } else if (data.status === 'queued') {
                 const age = Number(data.age_seconds);
@@ -617,7 +640,8 @@
             while (next < segments.length) {
                 const i = next++;
                 const dialogue = dialogueFor(segments[i]);
-                const key = hashText(dialogue);
+                // Scoped to the deck so deleting the deck can clear its audio.
+                const key = (currentDeckId || 'no-deck') + '|' + hashText(dialogue);
                 let blob, duration;
                 try {
                     const cached = await Store.getAudio(key);
