@@ -626,6 +626,33 @@
         return indices.map(function (i) { return podcast.turns[i].speaker + ': ' + podcast.turns[i].text; }).join('\n');
     }
 
+    // One segment's audio, retried.
+    // The provider intermittently refuses content that succeeds moments later
+    // (finishReason=OTHER, no audio), and the TTS quota is per-minute, so a
+    // failure here usually means "ask again shortly" rather than "this is broken".
+    // Successful segments stay in IndexedDB, so retrying only pays for the gaps.
+    async function synthesizeSegment(dialogue) {
+        const attempts = 3;
+        let lastError = 'no attempt made';
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                const resp = await fetch('/api/podcast_audio', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ dialogue: dialogue })
+                });
+                if (resp.ok) return resp;
+                let detail = '';
+                try { detail = (await resp.json()).error || ''; } catch (e) { /* not json */ }
+                lastError = detail || ('HTTP ' + resp.status);
+            } catch (e) {
+                lastError = e.message;
+            }
+            if (attempt < attempts) await wait(1500 * attempt * attempt);
+        }
+        throw new Error(lastError);
+    }
+
     async function generateAudio() {
         if (!podcast || !podcast.turns.length) return;
         const segments = buildSegments(podcast.turns, 900);
@@ -634,7 +661,10 @@
         podcastSegs = new Array(segments.length);
         let done = 0;
         let next = 0;
-        const CONCURRENCY = 3;
+        const failures = [];
+        // The synthesis quota is measured in requests per minute, so three
+        // concurrent workers mainly succeed in earning themselves a 429.
+        const CONCURRENCY = 2;
 
         async function worker() {
             while (next < segments.length) {
@@ -648,15 +678,19 @@
                     if (cached && cached.blob) { blob = cached.blob; duration = cached.duration; }
                 } catch (e) { /* ignore */ }
                 if (!blob) {
-                    const resp = await fetch('/api/podcast_audio', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ dialogue: dialogue })
-                    });
-                    if (!resp.ok) throw new Error('segment ' + (i + 1) + ' failed (' + resp.status + ')');
-                    blob = await resp.blob();
-                    duration = parseFloat(resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(segments[i]);
-                    await Store.putAudio(key, blob, duration);
+                    try {
+                        const resp = await synthesizeSegment(dialogue);
+                        blob = await resp.blob();
+                        duration = parseFloat(resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(segments[i]);
+                        await Store.putAudio(key, blob, duration);
+                    } catch (e) {
+                        // Record it and keep going: one bad segment must not throw
+                        // away every segment already generated and paid for.
+                        failures.push(i + 1);
+                        podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length
+                            + ' (segment ' + (i + 1) + ' failed, will need a retry)';
+                        continue;
+                    }
                 }
                 podcastSegs[i] = { turns: segments[i], url: URL.createObjectURL(blob), duration: duration };
                 done++;
@@ -665,7 +699,20 @@
         }
 
         try {
-            await Promise.all([worker(), worker(), worker()]);
+            const workers = [];
+            for (let w = 0; w < CONCURRENCY; w++) workers.push(worker());
+            await Promise.all(workers);
+
+            if (failures.length) {
+                // Segments that succeeded are cached, so clicking again only
+                // regenerates the missing ones.
+                podcastSegs.forEach(function (s) { if (s && s.url) URL.revokeObjectURL(s.url); });
+                podcastSegs = new Array(segments.length);
+                podcastStatus.textContent = 'Generated ' + done + ' of ' + segments.length
+                    + ' segments; ' + failures.join(', ') + ' failed. Press Generate again — the '
+                    + 'finished ones are reused.';
+                return;
+            }
             podcastStatus.textContent = '';
             podcastGenAudio.classList.add('hidden');
             podcastPlayer.classList.remove('hidden');
