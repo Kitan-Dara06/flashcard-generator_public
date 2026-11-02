@@ -42,13 +42,17 @@
     const podcastClose = $('podcastClose');
     const podcastTitle = $('podcastTitle');
     const podcastGenScript = $('podcastGenScript');
-    const podcastGenAudio = $('podcastGenAudio');
+    const podcastGenAllAudio = $('podcastGenAllAudio');
     const podcastStatus = $('podcastStatus');
-    const podcastPlayer = $('podcastPlayer');
-    const podcastPlay = $('podcastPlay');
-    const podcastProgress = $('podcastProgress');
-    const podcastTime = $('podcastTime');
+    const episodeList = $('episodeList');
     const podcastTranscript = $('podcastTranscript');
+    const miniPlayer = $('miniPlayer');
+    const miniPlay = $('miniPlay');
+    const miniTitle = $('miniTitle');
+    const miniTime = $('miniTime');
+    const miniProgress = $('miniProgress');
+    const miniOpen = $('miniOpen');
+    const typeModeBtn = $('typeModeBtn');
 
     // ---- constants ----
     const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
@@ -72,11 +76,17 @@
     // tab, or every engine failed). Already-finished groups are in Redis, so
     // resuming costs nothing for them.
     let resumeTried = false;
-    let podcast = null;          // { title, turns }
-    let podcastSegs = [];        // [{ turns:[idx], url, duration }]
+    let podcast = [];            // episodes: [{title,hook,turns,terms,coverage,segs,voice}]
+    let activeEpisode = 0;
     let podAudio = null;
-    let podSegIndex = -1;
+    let podSegIndex = -1;        // segment index within the active episode
     let podPlaying = false;
+    // True while any episode is being written or synthesised. Without it,
+    // clicking a second episode mid-generation started a second loop over the
+    // same segment array - two writers racing on one episode's clips.
+    let podcastBusy = false;
+    // Typing mode: opt-in, self-assessed, no LLM calls. The grade is the star.
+    let typingMode = false;
 
     // ---- utils ----
     function escapeHtml(text) {
@@ -451,6 +461,57 @@
         const starClass = card.starred ? 'star-btn starred' : 'star-btn';
         const quote = (card.source_quote || '').trim();
 
+        if (typingMode) {
+            studyCard.innerHTML =
+                '<div class="flashcard"><div class="flashcard-inner" id="fcInner">' +
+                '  <div class="flashcard-side flashcard-front">' +
+                '    <div class="card-top">' +
+                '      <div class="card-tags">' + chip + '</div>' +
+                '      <button class="' + starClass + '" id="starBtn" type="button" title="Star / unstar (S)">★</button>' +
+                '    </div>' +
+                '    <div class="card-body"><p class="card-text">' + escapeHtml(card.question) + '</p>' +
+                '      <textarea id="typeAnswer" class="type-answer" rows="3" placeholder="Type your answer, then Reveal…"></textarea>' +
+                '      <button id="typeReveal" class="generate-btn" type="button">Reveal</button>' +
+                '    </div>' +
+                '  </div>' +
+                '  <div class="flashcard-side flashcard-back">' +
+                '    <div class="card-top">' +
+                '      <button class="speak-btn" id="speakA" type="button" title="Read answer aloud">🔊</button>' +
+                '      <div class="card-tags"></div>' +
+                '      <button class="' + starClass + '" id="starBtnBack" type="button" title="Star / unstar (S)">★</button>' +
+                '    </div>' +
+                '    <div class="card-body">' +
+                '      <div id="typeComparison"></div>' +
+                '      <p class="card-text">' + escapeHtml(card.answer) + '</p>' +
+                (quote ? '<button class="quote-toggle" id="quoteToggle" type="button">📄 Show source</button>' +
+                         '<blockquote class="source-quote">' + escapeHtml(quote) + '</blockquote>' : '') +
+                '    </div>' +
+                '    <div class="type-grade">' +
+                '      <button class="grade-btn again" data-grade="again" type="button">Again</button>' +
+                '      <button class="grade-btn hard" data-grade="hard" type="button">Hard</button>' +
+                '      <button class="grade-btn good" data-grade="good" type="button">Got it</button>' +
+                '    </div>' +
+                '  </div></div></div>';
+            $('typeReveal').addEventListener('click', revealTypedAnswer);
+            $('typeAnswer').addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); revealTypedAnswer(); }
+            });
+            $('starBtn').addEventListener('click', function (e) { e.stopPropagation(); toggleStar(); });
+            $('starBtnBack').addEventListener('click', function (e) { e.stopPropagation(); toggleStar(); });
+            $('speakA').addEventListener('click', function (e) { e.stopPropagation(); speakText(card.answer, e.currentTarget); });
+            const q2 = $('quoteToggle');
+            if (q2) q2.addEventListener('click', function (e) {
+                e.stopPropagation();
+                const back = $('fcInner').querySelector('.flashcard-back');
+                const open = back.classList.toggle('quote-open');
+                q2.textContent = open ? '📄 Hide source' : '📄 Show source';
+            });
+            document.querySelectorAll('.grade-btn').forEach(function (b) {
+                b.addEventListener('click', function (e) { e.stopPropagation(); grade(b.dataset.grade); });
+            });
+            return;
+        }
+
         studyCard.innerHTML =
             '<div class="flashcard"><div class="flashcard-inner" id="fcInner">' +
             '  <div class="flashcard-side flashcard-front">' +
@@ -508,6 +569,57 @@
         if (flipped) $('fcInner').classList.add('flip');
     }
 
+    // ---- typing mode: local, offline, self-assessed ----------------
+    const TYPING_STOP = new Set(('a an the of to and or for with in on at by from as is are was were be been being has have had do does did not no yes it its this that these those i you he she they we our your his her their them me us then than so if but about above after again also among any because before below between both can could did down during each few more most much now off once only other over own same should some such there under until very what when where which while who whom why will would').split(' '));
+
+    function keyWords(s) {
+        return (s.toLowerCase().match(/[a-z0-9]+/g) || [])
+            .filter(function (w) { return w.length >= 4 && !TYPING_STOP.has(w); });
+    }
+
+    // Words in the expected answer the student did not type. These are the signal:
+    // what was forgotten, not what was remembered. No score is shown - a paraphrase
+    // that is right in different words will still show misses, so the student is
+    // the judge (via Again / Hard / Got it), never the string match.
+    function missedTerms(expected, user) {
+        const have = new Set(keyWords(user));
+        return Array.from(new Set(keyWords(expected))).filter(function (w) { return !have.has(w); });
+    }
+
+    function revealTypedAnswer() {
+        const idx = viewIndexes[cursor];
+        if (idx == null) return;
+        const card = deckCards[idx];
+        const typed = $('typeAnswer') ? $('typeAnswer').value : '';
+        const missed = missedTerms(card.answer, typed);
+        const box = $('typeComparison');
+        if (box) {
+            const missedSet = new Set(missed);
+            const highlighted = escapeHtml(card.answer).replace(/[A-Za-z0-9]+/g, function (word) {
+                return missedSet.has(word.toLowerCase())
+                    ? '<mark class="missed">' + word + '</mark>' : word;
+            });
+            box.innerHTML = '<div class="type-your"><span class="type-label">Your answer</span>' +
+                '<div class="type-typed">' + (escapeHtml(typed) || '<em>nothing typed</em>') + '</div></div>' +
+                '<div class="type-expected"><span class="type-label">Expected</span>' +
+                '<div>' + highlighted + '</div></div>';
+        }
+        toggleFlip();
+    }
+
+    // Again/Hard -> star on (goes back into the cram pile); Got it -> star off.
+    function grade(level) {
+        const idx = viewIndexes[cursor];
+        if (idx == null) return;
+        const shouldStar = level !== 'good';
+        if (deckCards[idx].starred !== shouldStar) {
+            deckCards[idx].starred = shouldStar;
+            Store.setStarred(currentDeckId, idx, shouldStar);
+            starredCount.textContent = deckCards.filter(function (c) { return c.starred; }).length;
+        }
+        step(1);
+    }
+
     function step(dir) {
         if (viewIndexes.length === 0) return;
         cursor = (cursor + dir + viewIndexes.length) % viewIndexes.length;
@@ -541,71 +653,156 @@
     }
 
     // =====================================================================
-    // Podcast
+    // Podcast (episodes, drawer + persistent mini-player)
     // =====================================================================
+    const VOICE_PAIRS = [
+        ['Kore', 'Puck'],
+        ['Zephyr', 'Charon'],
+        ['Aoede', 'Fenrir'],
+        ['Leda', 'Orus'],
+        ['Puck', 'Zephyr'],
+        ['Charon', 'Kore'],
+    ];
+    let podElapsed = 0;
+
+    function voiceFor(episodeIndex) {
+        return VOICE_PAIRS[episodeIndex % VOICE_PAIRS.length];
+    }
+
     async function openPodcast() {
-        stopPodcast();
         podcastPanel.classList.remove('hidden');
-        const saved = await Store.getPodcast(currentDeckId);
-        if (saved && saved.turns && saved.turns.length) {
-            podcast = { title: saved.title || deckTitle.textContent, turns: saved.turns };
-            podcastTitle.textContent = podcast.title;
+        const record = await Store.getPodcast(currentDeckId);
+        podcast = Store.normalizeEpisodes(record);
+        activeEpisode = 0;
+        if (podcast.length) {
+            podcastTitle.textContent = 'Podcast · ' + podcast.length + ' episode' + (podcast.length === 1 ? '' : 's');
+            renderEpisodeList();
             renderTranscript();
             podcastGenScript.classList.add('hidden');
-            podcastGenAudio.classList.remove('hidden');
-            podcastStatus.textContent = 'Script ready (' + podcast.turns.length + ' turns).';
+            podcastGenAllAudio.classList.remove('hidden');
+            podcastStatus.textContent = podcast.length + ' script' + (podcast.length === 1 ? '' : 's') + ' ready.';
         } else {
-            podcast = null;
             podcastTitle.textContent = 'Podcast';
+            episodeList.innerHTML = '';
             podcastTranscript.innerHTML = '';
             podcastGenScript.classList.remove('hidden');
-            podcastGenAudio.classList.add('hidden');
-            podcastStatus.textContent = 'No podcast yet for this deck.';
+            podcastGenAllAudio.classList.add('hidden');
+            podcastStatus.textContent = 'No episodes yet for this deck.';
         }
-        // reset player state
-        podcastPlayer.classList.add('hidden');
-        podcastSegs = [];
+        syncMiniPlayer();
+    }
+
+    function renderEpisodeList() {
+        if (!podcast.length) { episodeList.innerHTML = ''; return; }
+        episodeList.innerHTML = podcast.map(function (ep, i) {
+            const hasAudio = ep.segs && ep.segs.length;
+            return '<button class="episode-item' + (i === activeEpisode ? ' active' : '') + '" data-ep="' + i + '">' +
+                '<span class="episode-index">' + (i + 1) + '</span>' +
+                '<span class="episode-body">' +
+                '<span class="episode-title">' + escapeHtml(ep.title || ep.hook || ('Episode ' + (i + 1))) + '</span>' +
+                '<span class="episode-meta">' + ep.turns.length + ' turns' +
+                (hasAudio ? ' · ' + ep.segs.length + ' clips' : ' · no audio') + '</span></span>' +
+                '<span class="episode-action">' + (hasAudio ? '▶' : '🎧') + '</span></button>';
+        }).join('');
+        episodeList.querySelectorAll('.episode-item').forEach(function (btn) {
+            btn.addEventListener('click', function () { episodeAction(Number(btn.dataset.ep)); });
+        });
+    }
+
+    async function episodeAction(i) {
+        if (!podcast[i] || podcastBusy) return;
+        activeEpisode = i;
+        renderEpisodeList();
+        renderTranscript();
+        if (podcast[i].segs && podcast[i].segs.length) {
+            selectEpisode(i);
+        } else {
+            podcastBusy = true;
+            try { await generateAudio(i); }
+            finally { podcastBusy = false; }
+            if (podcast[i].segs && podcast[i].segs.length) selectEpisode(i);
+            renderEpisodeList();
+        }
+    }
+
+    function selectEpisode(i) {
+        activeEpisode = i;
         podSegIndex = -1;
-        podPlaying = false;
-        podcastPlay.textContent = '▶';
-        podcastProgress.style.width = '0%';
-        podcastTime.textContent = '0:00';
+        podElapsed = 0;
+        renderEpisodeList();
+        renderTranscript();
+        if (podcast[i].segs && podcast[i].segs.length) playSegment(0);
+        syncMiniPlayer();
     }
 
     function renderTranscript() {
-        if (!podcast || !podcast.turns.length) { podcastTranscript.innerHTML = ''; return; }
-        podcastTranscript.innerHTML = podcast.turns.map(function (t, i) {
+        const ep = podcast[activeEpisode];
+        if (!ep || !ep.turns.length) { podcastTranscript.innerHTML = ''; return; }
+        podcastTranscript.innerHTML = ep.turns.map(function (t, i) {
             return '<div class="podcast-turn" data-turn="' + i + '">' +
                 '<span class="podcast-speaker ' + t.speaker.toLowerCase() + '">' + escapeHtml(t.speaker) + '</span>' +
                 '<span class="podcast-text">' + escapeHtml(t.text) + '</span></div>';
         }).join('');
     }
 
+    // Scripts are driven one episode per request, exactly like card chunks. Doing
+    // all N in one call would be N LLM calls against a 60 s function limit, and a
+    // 10-episode deck would always time out.
     async function generateScript() {
+        if (podcastBusy) return;
         const deck = await Store.getDeck(currentDeckId);
         const text = deck && deck.text;
         if (!text) { podcastStatus.textContent = 'This deck has no saved source text. Regenerate the deck to enable podcast.'; return; }
+        const cards = await Store.getCards(currentDeckId);
+        // A cancelled card job leaves this set; without clearing it the loop
+        // below would break out on its first iteration and produce no episodes.
+        cancelRequested = false;
         podcastGenScript.disabled = true;
-        podcastStatus.textContent = 'Writing the script…';
+        podcastBusy = true;
+        podcastStatus.textContent = 'Planning episodes…';
+        const episodes = [];
+        const failures = [];
         try {
-            const resp = await fetch('/api/podcast_script', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text })
+            const plan = await fetch('/api/podcast_script', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text, cards: cards })
             });
-            const data = await resp.json();
-            if (!resp.ok || !data.success) throw new Error(data.error || 'script failed');
-            podcast = { title: data.title, turns: data.turns };
-            await Store.savePodcast(currentDeckId, podcast);
-            podcastTitle.textContent = data.title;
+            const planData = await plan.json();
+            if (!plan.ok || !planData.success) throw new Error(planData.error || 'planning failed');
+            const total = planData.total || 1;
+            for (let i = 0; i < total; i++) {
+                if (cancelRequested) break;
+                podcastStatus.textContent = 'Writing episode ' + (i + 1) + ' of ' + total + '…';
+                let data = {};
+                try {
+                    const resp = await fetch('/api/podcast_script', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: text, cards: cards, episode: i })
+                    });
+                    data = await resp.json();
+                    if (!resp.ok || !data.success) { failures.push(i + 1); continue; }
+                } catch (e) { failures.push(i + 1); continue; }
+                const ep = data.episode;
+                ep.segs = [];
+                episodes.push(ep);
+                // Save as we go: a deck interrupted here keeps the episodes done.
+                await Store.savePodcast(currentDeckId, episodes);
+            }
+            if (!episodes.length) throw new Error('no episode scripts generated');
+            podcast = episodes;
+            activeEpisode = 0;
+            podcastTitle.textContent = 'Podcast · ' + episodes.length + ' episode' + (episodes.length === 1 ? '' : 's');
+            renderEpisodeList();
             renderTranscript();
             podcastGenScript.classList.add('hidden');
-            podcastGenAudio.classList.remove('hidden');
-            podcastStatus.textContent = 'Script ready (' + data.turns.length + ' turns).';
+            podcastGenAllAudio.classList.remove('hidden');
+            podcastStatus.textContent = episodes.length + ' script' + (episodes.length === 1 ? '' : 's') + ' ready'
+                + (failures.length ? '; episode' + (failures.length > 1 ? 's ' : ' ') + failures.join(', ') + ' failed — press again to retry them' : '') + '.';
         } catch (e) {
             podcastStatus.textContent = 'Script failed: ' + e.message;
         } finally {
             podcastGenScript.disabled = false;
+            podcastBusy = false;
         }
     }
 
@@ -622,158 +819,185 @@
         return segs;
     }
 
-    function dialogueFor(indices) {
-        return indices.map(function (i) { return podcast.turns[i].speaker + ': ' + podcast.turns[i].text; }).join('\n');
+    function episodeDialogue(ep, seg) {
+        return seg.map(function (i) { return ep.turns[i].speaker + ': ' + ep.turns[i].text; }).join('\n');
     }
 
-    // One segment's audio, retried.
+    // One segment's audio, retried, with a voice fallback.
     // The provider intermittently refuses content that succeeds moments later
     // (finishReason=OTHER, no audio), and the TTS quota is per-minute, so a
     // failure here usually means "ask again shortly" rather than "this is broken".
-    // Successful segments stay in IndexedDB, so retrying only pays for the gaps.
-    async function synthesizeSegment(dialogue) {
+    // An unknown voice is a 400; it is retried with the verified default pair so
+    // voice variety never costs the episode. Returns {resp, pair}.
+    async function synthesizeSegment(dialogue, voice) {
+        const requested = (voice && voice.length === 2) ? voice : ['Kore', 'Puck'];
+        const pairs = (requested[0] === 'Kore' && requested[1] === 'Puck')
+            ? [requested] : [requested, ['Kore', 'Puck']];
         const attempts = 3;
         let lastError = 'no attempt made';
-        for (let attempt = 1; attempt <= attempts; attempt++) {
-            try {
-                const resp = await fetch('/api/podcast_audio', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ dialogue: dialogue })
-                });
-                if (resp.ok) return resp;
-                let detail = '';
-                try { detail = (await resp.json()).error || ''; } catch (e) { /* not json */ }
-                lastError = detail || ('HTTP ' + resp.status);
-            } catch (e) {
-                lastError = e.message;
+        for (let p = 0; p < pairs.length; p++) {
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                    const resp = await fetch('/api/podcast_audio', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ dialogue: dialogue, voices: pairs[p] })
+                    });
+                    if (resp.ok) return { resp: resp, pair: pairs[p] };
+                    let detail = '';
+                    try { detail = (await resp.json()).error || ''; } catch (e) { /* not json */ }
+                    lastError = detail || ('HTTP ' + resp.status);
+                    if (resp.status === 400 && p < pairs.length - 1) break;  // bad voice, try default
+                } catch (e) {
+                    lastError = e.message;
+                }
+                if (attempt < attempts) await wait(1500 * attempt * attempt);
             }
-            if (attempt < attempts) await wait(1500 * attempt * attempt);
         }
         throw new Error(lastError);
     }
 
-    async function generateAudio() {
-        if (!podcast || !podcast.turns.length) return;
-        const segments = buildSegments(podcast.turns, 900);
-        podcastGenAudio.disabled = true;
-        podcastStatus.textContent = 'Generating audio…';
-        podcastSegs = new Array(segments.length);
+    // Synthesize one episode's audio, pacing itself against the per-minute quota
+    // and collecting failures rather than aborting. Successful clips are cached in
+    // IndexedDB, so retrying only pays for the gaps.
+    async function generateAudio(epIndex) {
+        const ep = podcast[epIndex];
+        if (!ep || !ep.turns.length) return;
+        const segments = buildSegments(ep.turns, 900);
+        const voice = voiceFor(epIndex);
+        podcastStatus.textContent = 'Audio for "' + (ep.title || ep.hook) + '"…';
+        ep.segs = new Array(segments.length);
+        const CONCURRENCY = 1;      // the quota is per-minute; sequential is safer
         let done = 0;
-        let next = 0;
         const failures = [];
-        // The synthesis quota is measured in requests per minute, so three
-        // concurrent workers mainly succeed in earning themselves a 429.
-        const CONCURRENCY = 2;
 
-        async function worker() {
-            while (next < segments.length) {
-                const i = next++;
-                const dialogue = dialogueFor(segments[i]);
-                // Scoped to the deck so deleting the deck can clear its audio.
-                const key = (currentDeckId || 'no-deck') + '|' + hashText(dialogue);
-                let blob, duration;
-                try {
-                    const cached = await Store.getAudio(key);
-                    if (cached && cached.blob) { blob = cached.blob; duration = cached.duration; }
-                } catch (e) { /* ignore */ }
-                if (!blob) {
-                    try {
-                        const resp = await synthesizeSegment(dialogue);
-                        blob = await resp.blob();
-                        duration = parseFloat(resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(segments[i]);
-                        await Store.putAudio(key, blob, duration);
-                    } catch (e) {
-                        // Record it and keep going: one bad segment must not throw
-                        // away every segment already generated and paid for.
-                        failures.push(i + 1);
-                        podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length
-                            + ' (segment ' + (i + 1) + ' failed, will need a retry)';
-                        continue;
-                    }
+        for (let i = 0; i < segments.length; i++) {
+            const dialogue = episodeDialogue(ep, segments[i]);
+            let blob = null, duration = 0, pair = voice;
+            const checkKey = function (p) {
+                return (currentDeckId || 'no-deck') + '|' + p.join(',') + '|' + hashText(dialogue);
+            };
+            try {
+                const cached = await Store.getAudio(checkKey(voice));
+                if (cached && cached.blob) { blob = cached.blob; duration = cached.duration; }
+                else {
+                    // A previous episode may have had to fall back to the default
+                    // pair; reusing that avoids re-synthesising with a rejected voice.
+                    const alt = await Store.getAudio(checkKey(['Kore', 'Puck']));
+                    if (alt && alt.blob) { blob = alt.blob; duration = alt.duration; }
                 }
-                podcastSegs[i] = { turns: segments[i], url: URL.createObjectURL(blob), duration: duration };
-                done++;
-                podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length;
+            } catch (e) { /* ignore */ }
+            if (!blob) {
+                try {
+                    const result = await synthesizeSegment(dialogue, voice);
+                    pair = result.pair;
+                    blob = await result.resp.blob();
+                    duration = parseFloat(result.resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(ep, segments[i]);
+                    await Store.putAudio(checkKey(pair), blob, duration);
+                } catch (e) {
+                    failures.push(i + 1);
+                    podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length
+                        + ' (segment ' + (i + 1) + ' failed: ' + e.message + ')';
+                    continue;
+                }
             }
+            ep.segs[i] = { turns: segments[i], url: URL.createObjectURL(blob), duration: duration };
+            done++;
+            podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length;
+            renderEpisodeList();
+            await wait(1200);       // pace against the per-minute TTS quota
         }
-
-        try {
-            const workers = [];
-            for (let w = 0; w < CONCURRENCY; w++) workers.push(worker());
-            await Promise.all(workers);
-
-            if (failures.length) {
-                // Segments that succeeded are cached, so clicking again only
-                // regenerates the missing ones.
-                podcastSegs.forEach(function (s) { if (s && s.url) URL.revokeObjectURL(s.url); });
-                podcastSegs = new Array(segments.length);
-                podcastStatus.textContent = 'Generated ' + done + ' of ' + segments.length
-                    + ' segments; ' + failures.join(', ') + ' failed. Press Generate again — the '
-                    + 'finished ones are reused.';
-                return;
-            }
+        if (failures.length) {
+            podcastStatus.textContent = 'Generated ' + done + ' of ' + segments.length
+                + ' clips; ' + failures.join(', ') + ' failed. Click the episode again — finished ones are reused.';
+        } else {
             podcastStatus.textContent = '';
-            podcastGenAudio.classList.add('hidden');
-            podcastPlayer.classList.remove('hidden');
-        } catch (e) {
-            podcastStatus.textContent = 'Audio failed: ' + e.message;
-        } finally {
-            podcastGenAudio.disabled = false;
         }
     }
 
-    function estimateDuration(indices) {
-        const chars = indices.reduce(function (s, i) { return s + podcast.turns[i].text.length; }, 0);
+    async function generateAllAudio() {
+        if (podcastBusy) return;
+        podcastBusy = true;
+        podcastGenAllAudio.disabled = true;
+        try {
+            for (let i = 0; i < podcast.length; i++) {
+                await generateAudio(i);
+                await wait(2500);
+            }
+        } finally {
+            podcastBusy = false;
+            podcastGenAllAudio.disabled = false;
+            syncMiniPlayer();     // clips now exist for episodes the user is not on
+        }
+    }
+
+    function estimateDuration(ep, indices) {
+        const chars = indices.reduce(function (s, i) { return s + ep.turns[i].text.length; }, 0);
         return chars / 15;
     }
 
-    function totalDuration() {
-        return podcastSegs.reduce(function (s, seg) { return s + (seg.duration || 0); }, 0);
+    function episodeDuration(ep) {
+        return (ep.segs || []).reduce(function (s, seg) { return s + (seg.duration || 0); }, 0);
     }
 
     function togglePodcastPlay() {
-        if (!podcastSegs.length) return;
-        if (podPlaying) { podAudio.pause(); podPlaying = false; podcastPlay.textContent = '▶'; }
-        else if (podSegIndex < 0) { playSegment(0); }
-        else { podAudio.play(); podPlaying = true; podcastPlay.textContent = '⏸'; }
+        const ep = podcast[activeEpisode];
+        if (!ep || !(ep.segs || []).length) return;
+        if (podPlaying) { podAudio.pause(); podPlaying = false; syncMiniPlayer(); return; }
+        if (podSegIndex < 0) playSegment(0);
+        else { podAudio.play(); podPlaying = true; syncMiniPlayer(); }
     }
 
     function playSegment(i) {
+        const ep = podcast[activeEpisode];
+        if (!ep || !(ep.segs || [])[i]) return;
+        stopSpeaking();              // one voice at a time: card TTS vs podcast
         podSegIndex = i;
         if (!podAudio) {
             podAudio = new Audio();
             podAudio.onended = onSegmentEnded;
             podAudio.ontimeupdate = onTimeUpdate;
         }
-        podAudio.src = podcastSegs[i].url;
+        podAudio.src = ep.segs[i].url;
         podAudio.play().catch(function () {});
         podPlaying = true;
-        podcastPlay.textContent = '⏸';
+        syncMiniPlayer();
     }
 
     function onSegmentEnded() {
-        if (podSegIndex + 1 < podcastSegs.length) playSegment(podSegIndex + 1);
-        else { podPlaying = false; podcastPlay.textContent = '▶'; highlightTurn(-1); }
+        const ep = podcast[activeEpisode];
+        if (!ep) return;
+        const segs = ep.segs || [];
+        if (podSegIndex + 1 < segs.length) { playSegment(podSegIndex + 1); return; }
+        if (activeEpisode + 1 < podcast.length) { selectEpisode(activeEpisode + 1); return; }
+        podPlaying = false;
+        syncMiniPlayer();
+        highlightTurn(-1);
     }
 
     function onTimeUpdate() {
-        const seg = podcastSegs[podSegIndex];
-        if (!seg || !podAudio) return;
+        const ep = podcast[activeEpisode];
+        if (!ep || !podAudio) return;
+        const segs = ep.segs || [];
+        const seg = segs[podSegIndex];
+        if (!seg) return;
         let elapsed = 0;
-        for (let i = 0; i < podSegIndex; i++) elapsed += podcastSegs[i].duration || 0;
+        for (let i = 0; i < podSegIndex; i++) elapsed += segs[i].duration || 0;
         elapsed += podAudio.currentTime;
-        const total = totalDuration();
-        if (total > 0) podcastProgress.style.width = (100 * elapsed / total) + '%';
-        podcastTime.textContent = fmtTime(elapsed);
+        podElapsed = elapsed;
+        const total = episodeDuration(ep);
+        if (total > 0) miniProgress.style.width = (100 * elapsed / total) + '%';
+        miniTime.textContent = fmtTime(elapsed);
         highlightTurn(podSegIndex, seg.duration ? podAudio.currentTime / seg.duration : 0);
     }
 
     function highlightTurn(segIdx, frac) {
         podcastTranscript.querySelectorAll('.podcast-turn').forEach(function (r) { r.classList.remove('active'); });
-        if (segIdx < 0) return;
-        const seg = podcastSegs[segIdx];
-        const chars = seg.turns.map(function (i) { return Math.max(1, podcast.turns[i].text.length); });
+        const ep = podcast[activeEpisode];
+        if (!ep || segIdx < 0) return;
+        const seg = (ep.segs || [])[segIdx];
+        if (!seg) return;
+        const chars = seg.turns.map(function (i) { return Math.max(1, ep.turns[i].text.length); });
         const total = chars.reduce(function (a, b) { return a + b; }, 0);
         let acc = 0;
         for (let k = 0; k < seg.turns.length; k++) {
@@ -782,10 +1006,7 @@
             const end = acc / total;
             if (frac >= start && frac < end) {
                 const row = podcastTranscript.querySelector('[data-turn="' + seg.turns[k] + '"]');
-                if (row) {
-                    row.classList.add('active');
-                    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-                }
+                if (row) { row.classList.add('active'); row.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
                 return;
             }
         }
@@ -794,7 +1015,23 @@
     function stopPodcast() {
         if (podAudio) { podAudio.pause(); }
         podPlaying = false;
-        podcastPlay.textContent = '▶';
+        syncMiniPlayer();
+    }
+
+    function syncMiniPlayer() {
+        const ep = podcast[activeEpisode];
+        const hasAudio = !!(ep && (ep.segs || []).length);
+        miniPlayer.classList.toggle('hidden', !hasAudio);
+        // The bar is fixed over the deck; without clearance it would cover the
+        // nav buttons and the keyboard hint on the last thing you try to tap.
+        document.body.classList.toggle('pod-open', hasAudio);
+        miniPlay.textContent = podPlaying ? '⏸' : '▶';
+        miniTitle.textContent = ep ? (ep.title || ep.hook || 'Podcast') : 'Podcast';
+        miniTime.textContent = fmtTime(podElapsed);
+        if (hasAudio) {
+            const total = episodeDuration(ep);
+            if (total > 0) miniProgress.style.width = (100 * podElapsed / total) + '%';
+        }
     }
 
     function fmtTime(s) {
@@ -877,6 +1114,7 @@
 
     async function speakText(text, button) {
         stopSpeaking();
+        stopPodcast();               // one voice at a time: card TTS vs podcast
         const token = ++speakToken;
         const sentences = splitSentences(text);
         if (!sentences.length) return;
@@ -909,7 +1147,7 @@
     // =====================================================================
     generateBtn.addEventListener('click', generateDeck);
     exportBtn.addEventListener('click', exportCsv);
-    backBtn.addEventListener('click', function () { stopSpeaking(); renderHome(); });
+    backBtn.addEventListener('click', function () { stopSpeaking(); stopPodcast(); renderHome(); });
     shuffleBtn.addEventListener('click', function () { viewIndexes = shuffle(viewIndexes); cursor = 0; renderStudyCard(); updateProgress(); });
     searchInput.addEventListener('input', function () { cursor = 0; recomputeView(); renderStudyCard(); });
     document.querySelectorAll('.tab').forEach(function (tab) {
@@ -925,9 +1163,23 @@
     prevBtn.addEventListener('click', function () { step(-1); });
     nextBtn.addEventListener('click', function () { step(1); });
 
+    // typing mode: opt-in, persisted, no LLM calls
+    typingMode = localStorage.getItem('typingMode') === '1';
+    function setTypingMode(on) {
+        typingMode = on;
+        localStorage.setItem('typingMode', on ? '1' : '0');
+        typeModeBtn.classList.toggle('active', on);
+        renderStudyCard();
+    }
+    typeModeBtn.classList.toggle('active', typingMode);
+    typeModeBtn.addEventListener('click', function () { setTypingMode(!typingMode); });
+
     document.addEventListener('keydown', function (e) {
         if (deckView.classList.contains('hidden')) return;
-        if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) {
+        // Typing mode puts a TEXTAREA on the card. Without it here, a space
+        // in the student's answer would flip the card and swallow the space.
+        if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA'
+                      || e.target.tagName === 'BUTTON')) {
             if (e.target === searchInput && e.key === 'Escape') searchInput.blur();
             return;
         }
@@ -972,10 +1224,13 @@
 
     // podcast wiring
     podcastBtn.addEventListener('click', openPodcast);
-    podcastClose.addEventListener('click', function () { stopPodcast(); podcastPanel.classList.add('hidden'); });
+    // Closing the drawer hides the transcript but keeps audio playing, so the
+    // user can keep flipping cards while the episode runs (see the mini-player).
+    podcastClose.addEventListener('click', function () { podcastPanel.classList.add('hidden'); });
     podcastGenScript.addEventListener('click', generateScript);
-    podcastGenAudio.addEventListener('click', generateAudio);
-    podcastPlay.addEventListener('click', togglePodcastPlay);
+    podcastGenAllAudio.addEventListener('click', generateAllAudio);
+    miniPlay.addEventListener('click', togglePodcastPlay);
+    miniOpen.addEventListener('click', openPodcast);
 
     // service worker (offline app shell). updateViaCache:'none' stops the
     // browser from serving an old sw.js out of its HTTP cache, so deploys land.

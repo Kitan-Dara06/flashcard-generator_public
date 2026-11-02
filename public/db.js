@@ -161,19 +161,41 @@
         }
     }
 
-    // ----- podcast (phase 3) -----
+    // ----- podcast (episodes) -----
 
     async function getPodcast(deckId) {
         const db = await open();
         return get(db, STORES.podcasts, deckId);
     }
 
-    async function savePodcast(deckId, podcast) {
+    // Legacy decks stored one script as {title, turns}; the episode model stores
+    // {episodes: [...]}. This returns an episodes array either way so callers
+    // never have to know which shape they are reading.
+    function normalizeEpisodes(record) {
+        if (!record) return [];
+        if (Array.isArray(record.episodes)) return record.episodes;
+        if (Array.isArray(record.turns) && record.turns.length) {
+            return [{ title: record.title || 'Podcast', hook: record.title, turns: record.turns }];
+        }
+        return [];
+    }
+
+    async function savePodcast(deckId, episodes) {
         const db = await open();
+        // segs hold in-memory object URLs for audio; they cannot survive a reload
+        // and are rebuilt from the audio cache on demand. Store only the script.
+        const toStore = episodes.map(function (ep) {
+            return {
+                title: ep.title,
+                hook: ep.hook,
+                turns: ep.turns,
+                terms: ep.terms || [],
+                coverage: ep.coverage
+            };
+        });
         return put(db, STORES.podcasts, {
             deckId: deckId,
-            title: podcast.title,
-            turns: podcast.turns,
+            episodes: toStore,
             generatedAt: Date.now()
         });
     }
@@ -199,6 +221,7 @@
         deleteDeck: deleteDeck,
         getPodcast: getPodcast,
         savePodcast: savePodcast,
+        normalizeEpisodes: normalizeEpisodes,
         getAudio: getAudio,
         putAudio: putAudio
     };

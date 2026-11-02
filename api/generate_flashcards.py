@@ -802,6 +802,205 @@ def text_dedup(cards, threshold=0.75, answer_threshold=0.85):
 
 
 # =====================================================================
+# Podcast episodes: document sections, plus a per-episode checklist from the deck
+# =====================================================================
+# An episode is a bigger unit than a card group. It reuses section_chunks so the
+# two share boundaries, but with a larger budget (an episode has room for prose a
+# card list does not). 12k is still safely below the size where the model stops
+# enumerating and starts summarising (the knee we measured for cards).
+EPISODE_CHARS = int(os.environ.get("EPISODE_CHARS", "12000"))
+EPISODE_MAX = int(os.environ.get("EPISODE_MAX", "40"))
+
+
+def episode_sections(text):
+    """Split the document into heading-aligned, episode-sized pieces.
+
+    Returns a list of {index, title, text}. The title is the first heading in the
+    piece, or a fallback "Part N" for documents with no heading structure. The
+    episode count therefore emerges from the document rather than being chosen
+    up front.
+    """
+    chunks = section_chunks(text, max_chars=EPISODE_CHARS, max_chunks=EPISODE_MAX)
+    episodes = []
+    for i, chunk in enumerate(chunks, 1):
+        title = None
+        for line in chunk.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                title = stripped.lstrip("#").strip()
+                break
+        episodes.append({"index": i - 1, "title": title or f"Part {i}", "text": chunk})
+    return episodes
+
+
+def card_key_terms(card):
+    """The terms a podcast episode should insist on for one card.
+
+    Numbers and proper nouns are the two things the grounding gates already
+    guarantee are in the source, so they are safe to require of the episode
+    without an extra model call. They are a checklist, not an extractive
+    summary, so imprecision here only means a term is occasionally missed.
+    """
+    terms = set(numbers_in(str(card.get("answer", ""))))
+    for field in ("answer", "question"):
+        for word in capitalized_tokens(str(card.get(field, ""))):
+            # "Univasa's" can never match a script token: the article is
+            # separate, so the possessive would be a permanent false miss.
+            word = re.sub(r"['\u2019](s|S)?$", "", word).strip()
+            lower = word.lower()
+            if len(lower) < 3 or lower in STOPWORDS:
+                continue
+            terms.add(word)
+    return terms
+
+
+# Two surface forms of one word ("API" and "APIs") cost two cap slots and
+# guarantee a false miss, because a script says the word once. Canonicalising
+# the checklist is better than stemming while matching: it frees the slot, keeps
+# the comparison exact, and needs no fuzzy logic at read time.
+#
+# The merge is deliberately conservative: a plural is folded into its singular
+# ONLY when that singular actually occurs elsewhere in the deck. Stripping "s"
+# unconditionally looks harmless until it hits "SIWES" -> "siwe" (or "News",
+# "Status", "Glass"): four letters survive the length guard, so the rule below
+# needs evidence rather than a suffix.
+def _singular_candidates(key):
+    if not key.endswith("s"):
+        return []
+    out = [key[:-1]]                      # APIs -> API
+    if key.endswith("es") and len(key) > 3:
+        out.append(key[:-2])              # Boxes -> Box
+    return [c for c in out if len(c) >= 3 and c != key]
+
+
+def merge_plural_terms(counter):
+    """Fold plural keys into their singular, in place, only where the singular exists.
+
+    Takes and returns {norm_key: count}. "APIs" joins "API" because some card
+    writes "API"; "SIWES" stays alone because no card writes "SIWE".
+    """
+    for key in list(counter):
+        for singular in _singular_candidates(key):
+            if singular in counter:
+                counter[singular] += counter.pop(key)
+                break
+    return counter
+
+
+def deck_term_frequency(cards):
+    """How many cards mention each key term, with plurals folded into singulars.
+
+    This is the filter that keeps the checklist honest. Cover-page metadata
+    (the student's name, the submission month, "DEPARTMENT OF COMPUTING") is
+    real and grounded, so it survives every other check - but it appears in
+    one or two cards, while a subject worth a lecture appears across many.
+    Frequency across the deck is what separates "a fact in the document" from
+    "a fact about this course".
+
+    Keys are normalized terms after the plural merge, so "apis" never appears
+    here on its own when "api" does.
+    """
+    counts = {}
+    for card in cards:
+        for term in card_key_terms(card):
+            counts[norm(term)] = counts.get(norm(term), 0) + 1
+    return merge_plural_terms(counts)
+
+
+def canonical_key(term, counts):
+    """Where a term's count lives after the plural merge."""
+    key = norm(term)
+    if key in counts:
+        return key
+    for singular in _singular_candidates(key):
+        if singular in counts:
+            return singular
+    return key
+
+
+def deck_term_surface(cards, counts):
+    """The wording to ask a script for, per canonical key: the shortest form.
+
+    After "APIs" folds into "API", the checklist must demand "API" - asking for
+    the plural would recreate the miss the merge exists to remove.
+    """
+    forms = {}
+    for card in cards:
+        for term in card_key_terms(card):
+            forms.setdefault(canonical_key(term, counts), set()).add(term)
+    return {key: min(group, key=lambda s: (len(s), s.lower()))
+            for key, group in forms.items()}
+
+
+# Tunables. min_cards=2 is what removes cover-page metadata (a student's name,
+# the submission month appears in one or two cards); raising it thins the list
+# further, lowering it to 1 keeps every one-off figure but reintroduces the
+# metadata noise. Coverage is printed to the logs so this can be tuned against
+# real output rather than guessed.
+EPISODE_MIN_CARDS = int(os.environ.get("EPISODE_MIN_CARDS", "2"))
+EPISODE_TERM_CAP = int(os.environ.get("EPISODE_TERM_CAP", "35"))
+
+
+def map_cards_to_episodes(cards, episodes, min_cards=None, cap=None):
+    """Assign each card's terms to an episode by where its quote appears.
+
+    The mapping is by quote location in the document, not by card index: the
+    episode is owned by the heading that contains the quote, so the podcast
+    stays driven by the document's structure while the deck contributes only
+    a per-episode list of terms that must appear. Cards with no (or unmatched)
+    quote are skipped, as are terms the deck mentions fewer than `min_cards`
+    times.
+
+    `cap` bounds the checklist per episode. It was lowered to 18 on the theory
+    that 35 forced a recitation; measured on this document that was not what
+    happened - coverage was flat (82.9% vs 81.5%) and the shorter list let the
+    model ramble 40% longer and drop the deck's most frequent term entirely. The
+    real waste was duplicates like API/APIs, which canonicalisation removes.
+    """
+    min_cards = EPISODE_MIN_CARDS if min_cards is None else min_cards
+    cap = EPISODE_TERM_CAP if cap is None else cap
+    counts = deck_term_frequency(cards)
+    surface = deck_term_surface(cards, counts)
+    sources = [Source(e["text"]) for e in episodes]
+    buckets = [set() for _ in episodes]
+    for card in cards:
+        quote = str(card.get("source_quote", "")).strip()
+        if not quote:
+            continue
+        for i, source in enumerate(sources):
+            if quote_is_grounded(quote, source):
+                for term in card_key_terms(card):
+                    key = canonical_key(term, counts)
+                    if counts.get(key, 0) >= min_cards:
+                        buckets[i].add(key)
+                break
+    out = []
+    for bucket in buckets:
+        ranked = sorted(bucket, key=lambda k: (-counts.get(k, 0), k))
+        out.append(sorted({surface.get(k, k) for k in ranked[:cap]}, key=str.lower))
+    return out
+
+
+def script_coverage(terms, turns):
+    """How many of the must-include terms actually appear in a generated script.
+
+    Returns {covered, total, missing}. Not shown to the end user; it exists to
+    make "is the podcast covering enough?" a number that can be tuned against,
+    the way chunk size was tuned against cards per 1,000 characters.
+
+    Compared on token boundaries, not raw substrings: the same class of false
+    positive that let "1973" pass inside "11973" in the number gate. Padding
+    the normalized text and the term keeps whole-word matching while still
+    allowing a multi-token term, because norm() turns a hyphenated name like
+    "Igho-Iggue" into the two-word sequence "igho iggue".
+    """
+    script_padded = " " + norm(" ".join(t.get("text", "") for t in turns)) + " "
+    missing = [term for term in terms if " " + norm(term) + " " not in script_padded]
+    return {"covered": len(terms) - len(missing),
+            "total": len(terms), "missing": missing}
+
+
+# =====================================================================
 # Engines
 # =====================================================================
 class EngineFailure(Exception):

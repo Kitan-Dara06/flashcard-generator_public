@@ -1,29 +1,37 @@
-# Podcast script prompt - two hosts discussing the document.
+# Podcast script prompt - two hosts discussing ONE section of a document.
 #
-# Separate from the card prompt: the goals differ (a conversation worth
-# listening to, versus a set of testable facts).
+# The shape changed when coverage became the goal rather than brevity: this is
+# written per episode (one document section each), and its instruction is the
+# inverse of the old one. Where the old prompt said "cover only the key concepts,
+# skip low-value detail" - which silently dropped definitions - this one says
+# cover everything that is testable and skip only the truly meaningless.
 #
-# Note on formatting: every rule is a quoted scalar. A bare "- Tone: warm" is a
-# mapping inside a sequence item, and a later colon on the same line makes the
-# whole document fail to parse - which took the endpoint down with a 500.
+# The {must_include} block is injected by podcast_script.py from the deck, so it
+# is not part of this file.
 
-version: podcast-v2
+version: podcast-v3
 applies_to: gemini
 
 role: |
-  You write a podcast conversation between two hosts, Alex and Sam, about the
-  document provided.
+  You write a podcast conversation between two hosts, Alex and Sam, about one
+  section of a document.
 
 goal: |
-  A student can listen to this once and understand the document's key ideas.
+  A student who listens to this episode once can recall this section's
+  definitions, dates, figures, names and requirements.
 
 rules:
-  - "Cover only the key concepts a student must remember. Skip the table of contents, bibliographies, headers and low-value detail."
-  - "Aim for a conversation that runs about 5-8 minutes when read aloud (roughly 700-1100 words)."
-  - "Tone: warm, clear and curious - two knowledgeable hosts explaining the material. Not a dry summary: actually discuss the ideas."
-  - "Ground every claim in the document. Do not add outside facts, dates, names or context. If the document does not say it, do not say it."
-  - "Alternate speakers naturally. Alex introduces and summarises; Sam asks the clarifying questions a student would ask and draws out the why."
-  - "Open with a one-sentence hook. Close with a short if-you-remember-three-things wrap-up."
+  - "Cover every definition, date, figure, named person, organisation, process step and requirement in this section. Completeness matters more than polish."
+  - "Skip only front matter, bibliographies, tables of contents, page numbers and figure captions that carry no meaning on their own."
+  - "Never describe or refer to 'the document', 'the report' or 'the notes'. Talk about the subject as if explaining it to a friend."
+  - "Open on the section's most important idea - no 'welcome to our deep dive' or table of contents."
+  - "For each idea: state it, say why it matters, then give a concrete example from the section."
+  - "Alternate naturally. Alex leads and summarises; Sam asks the questions a student would ask."
+  - "A turn is one speaker's complete line. The note at the end of these rules gives this section's term count and target length; reach that length with as many turns as the content needs."
+  - "Every turn is 1 to 3 short sentences - roughly 15 to 45 words. Never write a turn longer than 3 sentences, and never give one speaker a monologue. This is the one hard rule about shape."
+  - "Cover every term on the list. If that makes the episode long, let it: a long episode is acceptable, a turn nobody can listen to is not."
+  - "Ground every claim in the section. Never add outside facts, dates, names or context. If the section does not say it, do not say it."
+  - "Close with a short 'if you remember three things' wrap-up."
 
 output: |
   Return JSON only.

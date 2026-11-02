@@ -14,10 +14,22 @@ from generate_flashcards import json_response, resolve_cors_headers
 
 TTS_MODEL = os.environ.get("PODCAST_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 
-# Host name -> Gemini prebuilt voice. Names must match the script generator's.
-HOST_VOICES = [
-    ("Alex", "Kore"),
-    ("Sam", "Puck"),
+# Host name -> Gemini prebuilt voice. The default pair is the one verified live;
+# the others are rotated in per episode by the client and fall back to this pair
+# if the provider rejects one.
+DEFAULT_VOICES = ("Kore", "Puck")
+HOST_NAMES = ("Alex", "Sam")
+
+# Candidate pairs for rotation across episodes. Only the first is verified; the
+# rest are confirmed lazily on first use because the TTS quota is too small to
+# check them all eagerly.
+VOICE_PAIRS = [
+    ("Kore", "Puck"),
+    ("Zephyr", "Charon"),
+    ("Aoede", "Fenrir"),
+    ("Leda", "Orus"),
+    ("Puck", "Zephyr"),
+    ("Charon", "Kore"),
 ]
 
 # Framing the transcript as something to render, which is the form Google's TTS
@@ -75,12 +87,16 @@ def pcm_to_wav(pcm: bytes, rate: int, channels: int = 1, sampwidth: int = 2) -> 
     return buf.getvalue()
 
 
-def synthesize(dialogue: str):
+def synthesize(dialogue: str, voices=None):
     """Returns (wav_bytes, duration_seconds).
 
     Audio generation cannot go through Zen: it proxies text models only, and
     multi-speaker TTS needs the Gemini API directly. A missing key is therefore
     reported as a clear 503 rather than a KeyError traceback.
+
+    `voices` is a pair (Alex's voice, Sam's voice); the default is the verified
+    pair. A rejected voice surfaces as a provider 400, which the caller treats as
+    retryable and answers by falling back to DEFAULT_VOICES.
 
     Note on retries: the provider sometimes answers with finishReason=OTHER and no
     audio for content that succeeds seconds later unchanged. That is treated as
@@ -97,6 +113,7 @@ def synthesize(dialogue: str):
     from google import genai
     from google.genai import types
 
+    pair = voices if isinstance(voices, (list, tuple)) and len(voices) == 2 else DEFAULT_VOICES
     client = genai.Client(api_key=api_key)
     speech = types.SpeechConfig(
         multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
@@ -107,7 +124,7 @@ def synthesize(dialogue: str):
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
                     ),
                 )
-                for name, voice in HOST_VOICES
+                for name, voice in zip(HOST_NAMES, pair)
             ]
         )
     )
@@ -140,6 +157,7 @@ def lambda_handler(event):
         try:
             body = json.loads(event["body"])
             dialogue = str(body.get("dialogue", "")).strip()
+            voices = body.get("voices")
         except (TypeError, ValueError):
             return json_response(400, {"success": False, "error": "Malformed request body"})
 
@@ -147,16 +165,16 @@ def lambda_handler(event):
             return json_response(400, {"success": False, "error": "Missing dialogue"})
         if len(dialogue) > 6000:
             return json_response(400, {"success": False, "error": "Dialogue too long"})
+        if voices is not None and not (isinstance(voices, list) and len(voices) == 2
+                                       and all(isinstance(v, str) for v in voices)):
+            return json_response(400, {"success": False,
+                                       "error": "voices must be a pair of names"})
 
         try:
-            wav, duration = synthesize(dialogue)
+            wav, duration = synthesize(dialogue, voices)
         except Exception as exc:
             print("TTS failed:", repr(exc))
             message = str(exc)
-            if "GEMINI_API_KEY" in message:
-                return json_response(503, {"success": False,
-                                           "error": "Podcast audio is not configured",
-                                           "details": message})
             # The provider's status decides what the client should do next, so it
             # must survive the hop: 429 means "back off and retry", a refusal means
             # "retry, this is flaky", and only a genuinely bad request is final.

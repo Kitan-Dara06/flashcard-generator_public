@@ -68,6 +68,7 @@
                     </div>
                     <input type="search" id="searchInput" class="search-input" placeholder="Search cards…" autocomplete="off" />
                     <button id="shuffleBtn" class="icon-btn" type="button" title="Shuffle order">🔀</button>
+                    <button id="typeModeBtn" class="icon-btn" type="button" title="Typing mode: type answers before revealing">⌨️</button>
                 </div>
 
                 <p id="emptyFilter" class="section-hint hidden">No cards match this view.</p>
@@ -78,6 +79,17 @@
                     <button id="nextBtn" class="nav-btn" type="button" aria-label="Next card">→</button>
                 </div>
                 <p class="keyboard-hint">space = flip · ← / → = navigate · S = star · / = search</p>
+
+                <!-- Persistent podcast bar: stays visible while flipping cards. -->
+                <div id="miniPlayer" class="mini-player hidden">
+                    <button id="miniPlay" class="nav-btn" type="button" aria-label="Play/pause">▶</button>
+                    <div class="mini-info">
+                        <span id="miniTitle" class="mini-title">Podcast</span>
+                        <span id="miniTime" class="mini-time">0:00</span>
+                    </div>
+                    <div class="mini-progress"><div id="miniProgress" class="mini-progress-bar"></div></div>
+                    <button id="miniOpen" class="icon-btn" type="button" aria-label="Open podcast">⤢</button>
+                </div>
             </div>
 
             <div id="error" class="error hidden"></div>
@@ -88,27 +100,19 @@
         </footer>
     </div>
 
-    <!-- ============ PODCAST ============ -->
-    <div id="podcastPanel" class="podcast-overlay hidden">
-        <div class="podcast-modal">
-            <div class="podcast-header">
-                <h2 id="podcastTitle">Podcast</h2>
-                <button id="podcastClose" class="back-btn" type="button" aria-label="Close">✕</button>
-            </div>
-            <div class="podcast-body">
-                <div class="podcast-actions">
-                    <button id="podcastGenScript" class="generate-btn" type="button">Generate podcast script</button>
-                    <button id="podcastGenAudio" class="generate-btn hidden" type="button">Generate audio</button>
-                    <p id="podcastStatus" class="section-hint"></p>
-                </div>
-                <div id="podcastPlayer" class="podcast-player hidden">
-                    <button id="podcastPlay" class="nav-btn" type="button" aria-label="Play">▶</button>
-                    <div class="podcast-progress-track"><div id="podcastProgress" class="podcast-progress"></div></div>
-                    <span id="podcastTime" class="podcast-time">0:00</span>
-                </div>
-                <div id="podcastTranscript" class="podcast-transcript"></div>
-            </div>
+    <!-- ============ PODCAST (drawer) ============ -->
+    <div id="podcastPanel" class="podcast-drawer hidden">
+        <div class="podcast-header">
+            <h2 id="podcastTitle">Podcast</h2>
+            <button id="podcastClose" class="back-btn" type="button" aria-label="Close">✕</button>
         </div>
+        <div class="podcast-actions">
+            <button id="podcastGenScript" class="generate-btn" type="button">Generate episodes</button>
+            <button id="podcastGenAllAudio" class="generate-btn hidden" type="button">Generate all audio</button>
+            <p id="podcastStatus" class="section-hint"></p>
+        </div>
+        <div id="episodeList" class="episode-list"></div>
+        <div id="podcastTranscript" class="podcast-transcript"></div>
     </div>
 
     <script src="db.js"></script>
