@@ -675,14 +675,22 @@
         podcast = Store.normalizeEpisodes(record);
         activeEpisode = 0;
         if (podcast.length) {
+            const legacy = podcast.length === 1 && podcast[0].legacy;
             podcastTitle.textContent = 'Podcast · ' + podcast.length + ' episode' + (podcast.length === 1 ? '' : 's');
             renderEpisodeList();
             renderTranscript();
-            podcastGenScript.classList.add('hidden');
+            // A single-script podcast predates the episode model. Hiding the
+            // button for it left no way at all to get episodes, so it stays
+            // visible and is relabelled as the conversion it is.
+            podcastGenScript.textContent = legacy ? 'Split into episodes' : 'Regenerate episodes';
+            podcastGenScript.classList.remove('hidden');
             podcastGenAllAudio.classList.remove('hidden');
-            podcastStatus.textContent = podcast.length + ' script' + (podcast.length === 1 ? '' : 's') + ' ready.';
+            podcastStatus.textContent = legacy
+                ? 'One long script from an older version. "Split into episodes" makes one episode per section.'
+                : podcast.length + ' script' + (podcast.length === 1 ? '' : 's') + ' ready.';
         } else {
             podcastTitle.textContent = 'Podcast';
+            podcastGenScript.textContent = 'Generate episodes';
             episodeList.innerHTML = '';
             podcastTranscript.innerHTML = '';
             podcastGenScript.classList.remove('hidden');
@@ -695,14 +703,17 @@
     function renderEpisodeList() {
         if (!podcast.length) { episodeList.innerHTML = ''; return; }
         episodeList.innerHTML = podcast.map(function (ep, i) {
-            const hasAudio = ep.segs && ep.segs.length;
+            const parts = ep.segs && ep.segs.length;
+            // "parts" not "clips": a part is one chunk of THIS episode's dialogue
+            // sent to the voice model (about 900 characters each), not an episode.
             return '<button class="episode-item' + (i === activeEpisode ? ' active' : '') + '" data-ep="' + i + '">' +
                 '<span class="episode-index">' + (i + 1) + '</span>' +
                 '<span class="episode-body">' +
                 '<span class="episode-title">' + escapeHtml(ep.title || ep.hook || ('Episode ' + (i + 1))) + '</span>' +
-                '<span class="episode-meta">' + ep.turns.length + ' turns' +
-                (hasAudio ? ' · ' + ep.segs.length + ' clips' : ' · no audio') + '</span></span>' +
-                '<span class="episode-action">' + (hasAudio ? '▶' : '🎧') + '</span></button>';
+                '<span class="episode-meta">' + ep.turns.length + ' lines' +
+                (parts ? ' · audio in ' + parts + ' part' + (parts === 1 ? '' : 's')
+                       : ' · no audio yet') + '</span></span>' +
+                '<span class="episode-action">' + (parts ? '▶' : '🎧') + '</span></button>';
         }).join('');
         episodeList.querySelectorAll('.episode-item').forEach(function (btn) {
             btn.addEventListener('click', function () { episodeAction(Number(btn.dataset.ep)); });
@@ -794,7 +805,10 @@
             podcastTitle.textContent = 'Podcast · ' + episodes.length + ' episode' + (episodes.length === 1 ? '' : 's');
             renderEpisodeList();
             renderTranscript();
-            podcastGenScript.classList.add('hidden');
+            podcastGenScript.textContent = 'Regenerate episodes';
+            // Deliberately NOT hidden after a successful run: hiding it is what
+            // left legacy decks with no way to convert, and the same trap would
+            // apply the moment a user wanted to re-split after changing decks.
             podcastGenAllAudio.classList.remove('hidden');
             podcastStatus.textContent = episodes.length + ' script' + (episodes.length === 1 ? '' : 's') + ' ready'
                 + (failures.length ? '; episode' + (failures.length > 1 ? 's ' : ' ') + failures.join(', ') + ' failed — press again to retry them' : '') + '.';
@@ -908,8 +922,9 @@
             await wait(1200);       // pace against the per-minute TTS quota
         }
         if (failures.length) {
-            podcastStatus.textContent = 'Generated ' + done + ' of ' + segments.length
-                + ' clips; ' + failures.join(', ') + ' failed. Click the episode again — finished ones are reused.';
+            podcastStatus.textContent = 'Audio ready for ' + done + ' of ' + segments.length
+                + ' parts of this episode; part' + (failures.length > 1 ? 's ' : ' ') + failures.join(', ')
+                + ' failed. Click the episode again — finished parts are reused.';
         } else {
             podcastStatus.textContent = '';
         }

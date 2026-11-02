@@ -8,7 +8,7 @@
  * /api/* is never touched: those are POSTs to Vercel and must always hit the
  * network.
  */
-const CACHE_VERSION = 'study-decks-v5';
+const CACHE_VERSION = 'study-decks-v6';
 const SHELL = ['/', '/index.html', '/style.css', '/script.js', '/db.js'];
 
 self.addEventListener('install', function (event) {

@@ -170,12 +170,14 @@
 
     // Legacy decks stored one script as {title, turns}; the episode model stores
     // {episodes: [...]}. This returns an episodes array either way so callers
-    // never have to know which shape they are reading.
+    // never have to know which shape they are reading, and marks the record so
+    // the UI can offer to convert it rather than hiding that option.
     function normalizeEpisodes(record) {
         if (!record) return [];
         if (Array.isArray(record.episodes)) return record.episodes;
         if (Array.isArray(record.turns) && record.turns.length) {
-            return [{ title: record.title || 'Podcast', hook: record.title, turns: record.turns }];
+            return [{ title: record.title || 'Podcast', hook: record.title,
+                       turns: record.turns, legacy: true }];
         }
         return [];
     }
