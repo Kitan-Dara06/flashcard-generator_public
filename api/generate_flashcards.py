@@ -397,6 +397,21 @@ def fold_small(chunks, max_chars, max_chunks):
     return chunks
 
 
+# A heading line as the extractor writes it: two to six '#' then a space.
+# The two-or-more floor matters. A single '#' is not a heading this app ever
+# produces - the DOCX extractor emits `## Heading` at minimum - so a lone '#'
+# line is something else entirely, typically C preprocessor output in a technical
+# report. `#include <stdio.h>` was rendering as an episode title until this was
+# tightened to match the splitter, which already required two or more.
+HEADING_RE = re.compile(r"^(#{2,6}) +(.+)$")
+
+
+def heading_title(line):
+    """The text of a heading line, or None if the line is not a heading."""
+    match = HEADING_RE.match((line or "").strip())
+    return match.group(2).strip() if match else None
+
+
 def section_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
     """Chunk on the document's own section boundaries.
 
@@ -423,7 +438,8 @@ def section_chunks(text, max_chars=CHUNK_CHARS, max_chunks=MAX_CHUNKS):
             current, current_len = [], 0
 
     for part in parts:
-        heading = part.split("\n", 1)[0] if part.startswith("#") else ""
+        heading = HEADING_RE.match(part.split("\n", 1)[0].strip())
+        heading = heading.group(0) if heading else ""
         # Continuation fragments keep the heading so the model still knows which
         # section it is writing cards for. Without this, a hard-split section
         # produces context-free orphans.
@@ -823,12 +839,8 @@ def episode_sections(text):
     chunks = section_chunks(text, max_chars=EPISODE_CHARS, max_chunks=EPISODE_MAX)
     episodes = []
     for i, chunk in enumerate(chunks, 1):
-        title = None
-        for line in chunk.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                title = stripped.lstrip("#").strip()
-                break
+        title = next((heading_title(line) for line in chunk.split("\n")
+                      if heading_title(line)), None)
         episodes.append({"index": i - 1, "title": title or f"Part {i}", "text": chunk})
     return episodes
 
