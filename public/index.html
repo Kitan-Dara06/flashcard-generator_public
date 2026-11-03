@@ -81,14 +81,23 @@
                 <p class="keyboard-hint">space = flip · ← / → = navigate · S = star · / = search</p>
 
                 <!-- Persistent podcast bar: stays visible while flipping cards. -->
-                <div id="miniPlayer" class="mini-player hidden">
-                    <button id="miniPlay" class="nav-btn" type="button" aria-label="Play/pause">▶</button>
+                <div id="miniPlayer" class="mini-player hidden" role="group" aria-label="Podcast player">
+                    <button id="miniPlay" class="mini-play" type="button" aria-label="Play podcast">
+                        <span class="mini-eq" aria-hidden="true"><i></i><i></i><i></i></span>
+                        <svg class="mini-icon-play" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                            <path d="M8 5.5v13l11-6.5z"/>
+                        </svg>
+                        <svg class="mini-icon-pause" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+                            <rect x="7" y="5.5" width="3.4" height="13" rx="1.2"/>
+                            <rect x="13.6" y="5.5" width="3.4" height="13" rx="1.2"/>
+                        </svg>
+                    </button>
                     <div class="mini-info">
                         <span id="miniTitle" class="mini-title">Podcast</span>
                         <span id="miniTime" class="mini-time">0:00</span>
                     </div>
-                    <div class="mini-progress"><div id="miniProgress" class="mini-progress-bar"></div></div>
-                    <button id="miniOpen" class="icon-btn" type="button" aria-label="Open podcast">⤢</button>
+                    <div class="mini-progress" aria-hidden="true"><div id="miniProgress" class="mini-progress-bar"></div></div>
+                    <button id="miniOpen" class="mini-open" type="button" aria-label="Open podcast">🎧</button>
                 </div>
             </div>
 

@@ -1,152 +1,124 @@
 # api/podcast_audio.py
-# Synthesises one dialogue segment to WAV using Gemini's multi-speaker TTS.
-# Body: { "dialogue": "Alex: ...\nSam: ..." }  ->  audio/wav (+ X-Audio-Duration)
-import io
+# Podcast audio via Deepgram Aura. One spoken line per request, one voice per
+# line, so the two hosts alternate by the speaker name the client sends.
+#
+# Body: { "speaker": "Alex"|"Sam", "text": "..." }  ->  audio/wav
+#
+# Why not the previous Gemini multi-speaker path: it can render both hosts in a
+# single call, but the account is blocked by a *monthly spending cap*, which
+# does not clear by retrying. Deepgram is per-character and per-line, which also
+# means each line is cached and retried independently.
+#
+# Auth note: Deepgram uses `Authorization: Token <key>`, NOT `Bearer`. Sending
+# Bearer returns 401 and looks exactly like a bad key.
 import json
 import os
 import sys
-import wave
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from generate_flashcards import json_response, resolve_cors_headers
 
-TTS_MODEL = os.environ.get("PODCAST_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+DEEPGRAM_BASE = os.environ.get("DEEPGRAM_BASE_URL", "https://api.deepgram.com")
+SAMPLE_RATE = 24000
 
-# Host name -> Gemini prebuilt voice. The default pair is the one verified live;
-# the others are rotated in per episode by the client and fall back to this pair
-# if the provider rejects one.
-DEFAULT_VOICES = ("Kore", "Puck")
-HOST_NAMES = ("Alex", "Sam")
+# The two hosts. The names must match what podcast_script.py generates and what
+# the transcript renderer displays; the models are Deepgram's canonical names.
+VOICE_BY_SPEAKER = {
+    "Alex": os.environ.get("PODCAST_VOICE_ALEX", "aura-2-orion-en"),
+    "Sam": os.environ.get("PODCAST_VOICE_SAM", "aura-2-draco-en"),
+}
 
-# Candidate pairs for rotation across episodes. Only the first is verified; the
-# rest are confirmed lazily on first use because the TTS quota is too small to
-# check them all eagerly.
-VOICE_PAIRS = [
-    ("Kore", "Puck"),
-    ("Zephyr", "Charon"),
-    ("Aoede", "Fenrir"),
-    ("Leda", "Orus"),
-    ("Puck", "Zephyr"),
-    ("Charon", "Kore"),
-]
-
-# Framing the transcript as something to render, which is the form Google's TTS
-# docs use. Worth stating plainly: this was added on the theory that it caused a
-# 400 refusal, and that theory was wrong - the same unframed content succeeds on a
-# retry. It is kept because it is the documented shape and costs nothing, not
-# because it fixes anything. The real cause was a flaky refusal plus a client that
-# treated any single failure as fatal (see public/script.js generateAudio).
-SPEECH_PROMPT = """Convert the following conversation into speech.
-
-Read the dialogue exactly as written, in order. Keep the speakers distinct so
-the two voices alternate as labelled. Do not answer, summarise, rephrase or add
-any commentary - produce only the spoken audio of these lines.
-
-{dialogue}"""
+LINE_MAX_CHARS = 1200       # one turn of dialogue; well inside a spoken sentence pair
+DEEPGRAM_TIMEOUT_SECONDS = int(os.environ.get("DEEPGRAM_TIMEOUT_SECONDS", "45"))
 
 
-def speech_prompt(dialogue):
-    return SPEECH_PROMPT.format(dialogue=dialogue)
+class DeepgramError(Exception):
+    """A Deepgram failure, already sorted into retryable or not.
 
-
-def find_audio(response):
-    """The first audio part in a response, or a diagnostic explaining its absence.
-
-    A bare "No audio in response" cannot be acted on; the finish reason and any
-    text the model returned instead say what actually happened (blocked, safety,
-    or still answering in text).
+    The distinction drives the client: a burst limit clears in seconds, an auth
+    or credit failure never will, and retrying the second one only wastes the
+    request budget.
     """
-    candidates = getattr(response, "candidates", None) or []
-    if not candidates:
-        feedback = getattr(response, "prompt_feedback", None)
-        blocked = getattr(feedback, "block_reason", None) if feedback else None
-        raise RuntimeError(f"no candidates returned (blockReason={blocked})")
 
-    content = getattr(candidates[0], "content", None)
-    parts = getattr(content, "parts", None) or []
-    text = "".join((getattr(p, "text", "") or "") for p in parts).strip()
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline is not None and getattr(inline, "data", None):
-            return inline
-
-    reason = getattr(candidates[0], "finish_reason", None)
-    detail = f" returned text instead of audio: {text[:200]!r}" if text else ""
-    raise RuntimeError(f"no audio part in response (finishReason={reason}){detail}")
+    def __init__(self, message, retryable):
+        super().__init__(message)
+        self.retryable = retryable
 
 
-def pcm_to_wav(pcm: bytes, rate: int, channels: int = 1, sampwidth: int = 2) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(channels)
-        w.setsampwidth(sampwidth)
-        w.setframerate(rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
+def synthesize(text, speaker="Alex"):
+    """Returns (wav_bytes, duration_seconds) for one spoken line."""
+    key = os.environ.get("DEEPGRAM_API_KEY")
+    if not key:
+        raise DeepgramError(
+            "DEEPGRAM_API_KEY is not set. Add it to this environment's variables "
+            "in Vercel and redeploy.", retryable=False)
 
-
-def synthesize(dialogue: str, voices=None):
-    """Returns (wav_bytes, duration_seconds).
-
-    Audio generation cannot go through Zen: it proxies text models only, and
-    multi-speaker TTS needs the Gemini API directly. A missing key is therefore
-    reported as a clear 503 rather than a KeyError traceback.
-
-    `voices` is a pair (Alex's voice, Sam's voice); the default is the verified
-    pair. A rejected voice surfaces as a provider 400, which the caller treats as
-    retryable and answers by falling back to DEFAULT_VOICES.
-
-    Note on retries: the provider sometimes answers with finishReason=OTHER and no
-    audio for content that succeeds seconds later unchanged. That is treated as
-    flaky at the caller (one HTTP request can't afford the backoff), so this
-    function stays a single attempt and Vercel's time limit is not at risk.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. Podcast audio needs the Gemini API "
-            "directly - the Zen proxy serves text models only."
-        )
-
-    from google import genai
-    from google.genai import types
-
-    pair = voices if isinstance(voices, (list, tuple)) and len(voices) == 2 else DEFAULT_VOICES
-    client = genai.Client(api_key=api_key)
-    speech = types.SpeechConfig(
-        multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
-            speaker_voice_configs=[
-                types.SpeakerVoiceConfig(
-                    speaker=name,
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                    ),
-                )
-                for name, voice in zip(HOST_NAMES, pair)
-            ]
-        )
+    model = VOICE_BY_SPEAKER.get(speaker) or VOICE_BY_SPEAKER["Alex"]
+    url = (f"{DEEPGRAM_BASE}/v1/speak?model={model}"
+           f"&encoding=linear16&sample_rate={SAMPLE_RATE}&container=wav")
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"text": text}).encode("utf-8"),
+        headers={
+            # `Token`, not `Bearer` - see the note at the top of this file.
+            "Authorization": f"Token {key}",
+            "Content-Type": "application/json",
+            # Explicit so it is obvious which service a log line refers to.
+            "User-Agent": "flashcard-generator/1.0",
+        },
+        method="POST",
     )
-    config = types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=speech)
-    response = client.models.generate_content(model=TTS_MODEL,
-                                              contents=speech_prompt(dialogue),
-                                              config=config)
-
-    inline = find_audio(response)
-    pcm = inline.data
-    mime = getattr(inline, "mime_type", "") or ""
-
-    rate = 24000
-    if "rate=" in mime:
+    try:
+        with urllib.request.urlopen(request, timeout=DEEPGRAM_TIMEOUT_SECONDS) as resp:
+            wav = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
         try:
-            rate = int(mime.split("rate=")[1].split(";")[0])
-        except ValueError:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
             pass
+        raise DeepgramError(_describe(exc.code, detail), retryable=_is_transient(exc.code, detail))
+    except urllib.error.URLError as exc:
+        raise DeepgramError(f"could not reach Deepgram: {exc.reason}", retryable=True)
+    except (TimeoutError, OSError) as exc:
+        raise DeepgramError(f"Deepgram request failed: {exc}", retryable=True)
 
-    wav = pcm_to_wav(pcm, rate)
-    duration = len(pcm) / (rate * 2)  # 16-bit mono
+    if not wav or len(wav) <= 44:
+        raise DeepgramError("Deepgram returned no audio", retryable=True)
+
+    duration = (len(wav) - 44) / (SAMPLE_RATE * 2)   # 16-bit mono, minus the header
     return wav, duration
+
+
+def _is_transient(status, detail):
+    """Retryable = a burst limit or a transport fault, not a credential problem."""
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+    if status in (401, 403):
+        return False
+    text = (detail or "").lower()
+    return any(marker in text for marker in
+               ("timed out", "temporarily", "unavailable", "overloaded", "rate limit"))
+
+
+def _describe(status, detail):
+    """A message a student can act on, because the raw error rarely is."""
+    text = (detail or "").lower()
+    if status == 401:
+        return ("Deepgram rejected the API key (401). Check that DEEPGRAM_API_KEY is "
+                "set for this environment - requests must use the Token scheme, not "
+                "Bearer.")
+    if status in (402, 403) or "insufficient" in text or "balance" in text or "credit" in text:
+        return ("Deepgram is out of credit for this account (HTTP "
+                f"{status}). Podcast audio needs credit; card read-aloud uses a "
+                "different engine and still works.")
+    if status == 429:
+        return "Deepgram is rate limiting this account (429). Try again shortly."
+    return f"Deepgram request failed ({status}): {detail}"
 
 
 def lambda_handler(event):
@@ -156,44 +128,28 @@ def lambda_handler(event):
 
         try:
             body = json.loads(event["body"])
-            dialogue = str(body.get("dialogue", "")).strip()
-            voices = body.get("voices")
+            text = str(body.get("text", "")).strip()
+            speaker = str(body.get("speaker", "Alex")).strip()
         except (TypeError, ValueError):
             return json_response(400, {"success": False, "error": "Malformed request body"})
 
-        if not dialogue:
-            return json_response(400, {"success": False, "error": "Missing dialogue"})
-        if len(dialogue) > 6000:
-            return json_response(400, {"success": False, "error": "Dialogue too long"})
-        if voices is not None and not (isinstance(voices, list) and len(voices) == 2
-                                       and all(isinstance(v, str) for v in voices)):
+        if not text:
+            return json_response(400, {"success": False, "error": "Missing text"})
+        if len(text) > LINE_MAX_CHARS:
             return json_response(400, {"success": False,
-                                       "error": "voices must be a pair of names"})
+                                       "error": f"Line too long (max {LINE_MAX_CHARS} chars)"})
 
         try:
-            wav, duration = synthesize(dialogue, voices)
+            wav, duration = synthesize(text, speaker)
+        except DeepgramError as exc:
+            print("TTS failed:", exc)
+            return json_response(503 if exc.retryable else 502,
+                                {"success": False, "retryable": exc.retryable,
+                                 "error": str(exc)})
         except Exception as exc:
             print("TTS failed:", repr(exc))
-            message = str(exc)
-            # The provider's status decides what the client should do next, so it
-            # must survive the hop: 429 means "back off and retry", a refusal means
-            # "retry, this is flaky", and only a genuinely bad request is final.
-            if "GEMINI_API_KEY" in message:
-                return json_response(503, {"success": False,
-                                           "retryable": True,
-                                           "error": "Podcast audio is not configured",
-                                           "details": message})
-            if "429" in message or "RESOURCE_EXHAUSTED" in message:
-                return json_response(429, {"success": False, "retryable": True,
-                                           "error": "Speech synthesis is rate limited. "
-                                                    "Retry in a moment.",
-                                           "details": message})
-            if "400" in message or "INVALID_ARGUMENT" in message:
-                return json_response(400, {"success": False, "retryable": True,
-                                           "error": "TTS refused this segment",
-                                           "details": message})
             return json_response(502, {"success": False, "retryable": True,
-                                       "error": "TTS failed", "details": message})
+                                       "error": "TTS failed", "details": str(exc)})
 
         return {
             "statusCode": 200,
@@ -201,6 +157,7 @@ def lambda_handler(event):
                 "Content-Type": "audio/wav",
                 "Content-Length": str(len(wav)),
                 "X-Audio-Duration": "%.2f" % duration,
+                "X-Audio-Voice": VOICE_BY_SPEAKER.get(speaker, VOICE_BY_SPEAKER["Alex"]),
             },
             "body": wav,
         }
@@ -214,13 +171,14 @@ def lambda_handler(event):
 
 class handler(BaseHTTPRequestHandler):
     def _send(self, response):
+        headers = response.get("headers", {})
         body = response["body"]
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(response["statusCode"])
-        for k, v in response.get("headers", {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
-        if "Content-Length" not in response.get("headers", {}):
+        if "Content-Length" not in headers:
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

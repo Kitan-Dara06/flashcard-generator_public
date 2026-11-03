@@ -81,6 +81,7 @@ Failing every API engine is a reason to try the other one, never a reason to fai
    | `OPENCODE_BASE_URL` | no | Zen endpoint (default `https://opencode.ai/inference/google/v1beta`) |
    | `ZEN_USER_AGENT` | no | Cloudflare in front of Zen 403s urllib's default UA; any explicit value works |
    | `GEMINI_API_KEY` | fallback | Direct Gemini key, used when Zen fails |
+   | `DEEPGRAM_API_KEY` | podcast audio | Deepgram Aura key for the two-host podcast. Requests use the `Token` scheme |
    | `GEMINI_MODEL` | no | Direct-model id (default `gemini-2.5-flash`) |
    | `GEMINI_CHUNK_CHARS` | no | Card section-group size in characters (default `6000` — the measured coverage knee; keep a group inside the 60 s limit) |
    | `GEMINI_MAX_CHUNKS` | no | Ceiling on card calls per document (default `100`). Must stay high enough that `len(text)/it` never exceeds `GEMINI_CHUNK_CHARS`, or chunks silently grow past the knee |
@@ -112,7 +113,7 @@ Failing every API engine is a reason to try the other one, never a reason to fai
 | POST | `/api/cancel` | Cancel a running job (body: `{job_id}`) |
 | POST | `/api/tts` | Synthesize one sentence to WAV audio (body: `{text}`) |
 | POST | `/api/podcast_script` | Podcast episodes. No `episode` → `{total}` plan only; `{episode: i}` → one script |
-| POST | `/api/podcast_audio` | Synthesize one dialogue segment to WAV (body: `{dialogue, voices}`) |
+| POST | `/api/podcast_audio` | Synthesize one spoken line to WAV (body: `{speaker, text}`) |
 | POST | `/api/warmup` | Pre-warm the Modal GPU container |
 
 Auth is disabled (single user, single device, no accounts); the endpoints are public. `ALLOWED_ORIGINS` still gates cross-origin reads.
@@ -129,11 +130,13 @@ A deck's podcast is a **list of episodes**, one per heading-aligned section of t
   - plural merge — `APIs` folds into `API` **only when the singular actually occurs in the deck**, so `SIWES` is never chopped into `siwe`. Two surface forms of one word cost two cap slots and guarantee a false miss, because a script says the word once.
   - `EPISODE_TERM_CAP` (default 35). The instinct that 35 forces a recitation was measured and did not hold: dropping to 18 gave **lower** coverage (79.6% vs 83.3%) and no shorter scripts (1110 vs 1146 words) — the model just wandered, and one episode at cap 18 failed to mention `SIWES` at all. The checklist behaves as a floor, not a constraint on elegance. See `tune_terms.py`.
 - **Coverage is measured, never displayed.** `script_coverage()` returns covered/total/missing as whole-token matches. It is not shown in the UI — it exists so "is this covering enough?" is a number you can tune against, the way chunk size was tuned against cards per 1,000 characters.
-- **Voices rotate** across episodes (`VOICE_PAIRS`) so a playlist does not sound identical throughout; only `Kore`/`Puck` are verified live, and a rejected voice falls back to that pair rather than failing the episode. Cached audio keys include the voice pair, so a voice change can never replay the other voice's clip.
+- **Voices**: `Alex` is `aura-2-orion-en`, `Sam` is `aura-2-draco-en` (chosen by ear; draco's British baritone against orion's American calm). Mapping lives in `VOICE_BY_SPEAKER` in `api/podcast_audio.py`, overridable with `PODCAST_VOICE_ALEX` / `PODCAST_VOICE_SAM`. Deepgram renders **one voice per request**, so the client sends one line at a time — which also means each line caches and retries on its own.
+- **Playback speed is `1.1x`, applied client-side** (`playbackRate` + `preservesPitch`). Not baked into synthesis: Deepgram's own `speed`/`pitch` query params measured unreliable (`speed=1.1` produced *longer* audio), and a client-side rate keeps one cached clip valid at any speed. `PLAYBACK_RATE` is stored in `localStorage` under `podcastRate`.
+- **Auth scheme is `Token`, not `Bearer`.** A `Bearer` request returns 401 and looks exactly like an invalid key — worth knowing before debugging a "bad" key.
 - **Episode length is bounded by shape, not by word count.** A "700-1100 words" instruction is the one thing this model ignores: measured output ran 480-1976 words with single turns up to **267 words** - a monologue nobody can listen to. What holds is the locally checkable rule: **1-3 sentences, under 70 words per turn**, enforced by `band_problems()` and retried once. Per-episode target length is derived from the checklist size (`EPISODE_WORDS_PER_TERM`), because 35 terms cannot be named in 500 words.
 
   Two wider clamps were tried, measured, and removed. A **turn ceiling** dropped one episode's coverage from 91% to 80% while producing 71 short turns that were perfectly listenable. A **thinness retry** made the model pad connective filler and cover fewer terms (83% → 71%). Both now only *report*: `in_band` flags real defects, `thin` flags a short-but-valid script without rewriting it. On the real deck after this change: longest turn 267 → 46 words, coverage 75% overall but 91% on a dense technical section and 57% on the front matter - the remaining spread is how discussable each section is, not a defect to clamp. Tune with `tune_terms.py`.
-- **Audio pacing**: `CONCURRENCY = 1` plus a pause per clip and between episodes, because the TTS quota is per-*minute* — three parallel workers mostly earn themselves a 429. A failed clip is collected, not fatal: cached clips are reused, so pressing again only pays for the gaps.
+- **Audio pacing**: requests are sequential with a short gap per line and between episodes. Gemini's TTS quota was per-*minute*; Deepgram's is credit-based, but pacing still matters because a full document is several hundred line requests (~55 per episode).
 
 - **Listen while you study.** The podcast is a side **drawer**, not a full-screen modal, and closing it only hides the transcript — playback continues in a persistent mini-player fixed over the deck. (The old modal was `position: fixed; inset: 0`, so the podcast and the flashcards were mutually exclusive by construction.)
 

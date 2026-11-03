@@ -9,3 +9,6 @@ preview.html
 .preview/
 .venv/
 gemini_cards.json
+
+# local audio samples from provider probing - regenerable, several MB, never committed
+*.wav

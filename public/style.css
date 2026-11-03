@@ -722,33 +722,132 @@ body.has-file .upload-label { border-color: var(--success); }
 .episode-meta { font-size: 0.8em; color: var(--ink-soft); }
 .episode-action { flex: 0 0 auto; color: var(--accent); font-size: 1.1em; }
 
-/* persistent mini-player */
+/* persistent mini-player - a glass pill, so it sits over the deck softly
+ * instead of a solid bar stamping on it. State (playing) is a class; the icons
+ * and the equalizer are CSS-only. */
 .mini-player {
     position: fixed;
     left: 50%;
     transform: translateX(-50%);
-    bottom: 18px;
-    width: min(560px, calc(100vw - 32px));
+    bottom: 20px;
+    width: min(520px, calc(100vw - 28px));
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 14px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    padding: 8px 10px 8px 8px;
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(16px) saturate(1.35);
+    -webkit-backdrop-filter: blur(16px) saturate(1.35);
+    border: 1px solid rgba(99, 102, 241, 0.22);
     border-radius: 999px;
-    box-shadow: var(--shadow-lg);
+    box-shadow: 0 18px 44px rgba(15, 23, 42, 0.16),
+                inset 0 1px 0 rgba(255, 255, 255, 0.85);
     z-index: 800;
+    animation: mini-in 0.34s cubic-bezier(0.22, 1, 0.36, 1);
 }
-.mini-player .nav-btn { width: 38px; height: 38px; flex: 0 0 auto; }
-.mini-info { flex: 0 1 auto; min-width: 0; display: flex; flex-direction: column; line-height: 1.2; }
-.mini-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
-.mini-time { font-size: 0.8em; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
-.mini-progress { flex: 1; height: 5px; border-radius: 999px; background: rgba(99, 102, 241, 0.15); overflow: hidden; }
-.mini-progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--success)); }
-.mini-player .icon-btn { flex: 0 0 auto; }
-/* The mini-player is fixed over the deck; give the nav row room so the bar
- * never sits on top of the buttons a student is trying to tap. */
-body.pod-open #deckView { padding-bottom: 96px; }
+@keyframes mini-in {
+    from { opacity: 0; transform: translateX(-50%) translateY(14px) scale(0.95); }
+    to   { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1); }
+}
+
+/* play/pause: an accent-gradient disc, not a bordered circle */
+.mini-play {
+    position: relative;
+    flex: 0 0 auto;
+    width: 44px; height: 44px;
+    border: none;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), #8b5cf6);
+    color: #fff;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    box-shadow: 0 6px 16px rgba(99, 102, 241, 0.38);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+.mini-play:hover { transform: scale(1.06); box-shadow: 0 8px 22px rgba(99, 102, 241, 0.46); }
+.mini-play:active { transform: scale(0.97); }
+.mini-play svg { width: 20px; height: 20px; }
+.mini-icon-pause { display: none; }
+.mini-player.playing .mini-icon-pause { display: block; }
+.mini-player.playing .mini-icon-play  { display: none; }
+
+/* equalizer: the quiet "this is live" tell, visible only while playing */
+.mini-eq {
+    position: absolute;
+    display: none;
+    align-items: flex-end;
+    gap: 2.5px;
+    height: 14px;
+}
+.mini-player.playing .mini-eq { display: flex; }
+.mini-eq i {
+    width: 3px;
+    border-radius: 2px;
+    background: #fff;
+    animation: eq-bounce 1s ease-in-out infinite;
+}
+.mini-eq i:nth-child(1) { height: 7px;  animation-delay: -0.45s; }
+.mini-eq i:nth-child(2) { height: 13px; animation-delay: -0.20s; }
+.mini-eq i:nth-child(3) { height: 9px;  animation-delay: -0.70s; }
+@keyframes eq-bounce {
+    0%, 100% { transform: scaleY(0.55); }
+    50%      { transform: scaleY(1); }
+}
+.mini-player.playing .mini-play {
+    background: linear-gradient(135deg, var(--accent-deep), var(--accent));
+}
+
+.mini-info { flex: 0 1 auto; min-width: 0; display: flex; flex-direction: column; line-height: 1.25; }
+.mini-title {
+    font-weight: 650;
+    font-size: 0.92em;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 210px;
+}
+.mini-time { font-size: 0.75em; color: var(--ink-faint); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+
+.mini-progress {
+    flex: 1;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.14);
+    overflow: hidden;
+}
+.mini-progress-bar {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), var(--success));
+    box-shadow: 0 0 10px rgba(99, 102, 241, 0.45);
+    transition: width 0.25s linear;
+}
+
+.mini-open {
+    flex: 0 0 auto;
+    width: 38px; height: 34px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: var(--surface-dim);
+    color: var(--ink-soft);
+    font-size: 0.95em;
+    cursor: pointer;
+    transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+.mini-open:hover { background: var(--accent-soft); color: var(--accent-deep); transform: translateY(-1px); }
+
+/* The bar is fixed over the deck; give the nav row room so it never sits on
+ * top of the buttons a student is trying to tap. */
+body.pod-open #deckView { padding-bottom: 104px; }
+
+@media (max-width: 768px) {
+    .mini-player { gap: 9px; bottom: 14px; padding: 7px 8px 7px 7px; }
+    .mini-title { max-width: 130px; }
+    .mini-play { width: 40px; height: 40px; }
+}
 
 /* typing mode */
 .icon-btn.active { background: var(--accent); color: #fff; }
@@ -791,4 +890,7 @@ mark.missed { background: rgba(220, 38, 38, 0.18); color: #b91c1c; border-radius
     .spinner { animation-duration: 1.6s; }
     .speak-btn.playing { animation: none; }
     .flashcard-inner { transition-duration: 0.2s; }
+    .mini-player { animation: none; }
+    .mini-eq i { animation: none; }
+    .mini-progress-bar { transition: none; }
 }

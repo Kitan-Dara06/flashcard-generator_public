@@ -655,19 +655,12 @@
     // =====================================================================
     // Podcast (episodes, drawer + persistent mini-player)
     // =====================================================================
-    const VOICE_PAIRS = [
-        ['Kore', 'Puck'],
-        ['Zephyr', 'Charon'],
-        ['Aoede', 'Fenrir'],
-        ['Leda', 'Orus'],
-        ['Puck', 'Zephyr'],
-        ['Charon', 'Kore'],
-    ];
+    // Playback speed. The voices settled at 1.1x, and doing it here rather than
+    // in the synthesis request keeps one cached clip valid at any speed - and
+    // Deepgram's own speed/pitch query parameters measured unreliable.
+    const PLAYBACK_RATE = Number(localStorage.getItem('podcastRate') || '1.1');
+    let podcastQuota = false;       // set when Deepgram reports a non-retryable failure
     let podElapsed = 0;
-
-    function voiceFor(episodeIndex) {
-        return VOICE_PAIRS[episodeIndex % VOICE_PAIRS.length];
-    }
 
     async function openPodcast() {
         podcastPanel.classList.remove('hidden');
@@ -820,122 +813,116 @@
         }
     }
 
-    function buildSegments(turns, maxChars) {
-        const segs = [];
-        let cur = [];
-        let len = 0;
-        turns.forEach(function (t, i) {
-            const l = t.text.length + 8;
-            if (cur.length && len + l > maxChars) { segs.push(cur); cur = [i]; len = l; }
-            else { cur.push(i); len += l; }
-        });
-        if (cur.length) segs.push(cur);
-        return segs;
+    // Deepgram renders one voice per request, so a segment is a single spoken
+    // line rather than a 900-character batch of dialogue. The player already
+    // advances segment by segment, and per-line clips cache and retry individually.
+    function lineSegments(ep) {
+        return ep.turns.map(function (t, i) { return i; });
     }
 
-    function episodeDialogue(ep, seg) {
-        return seg.map(function (i) { return ep.turns[i].speaker + ': ' + ep.turns[i].text; }).join('\n');
-    }
-
-    // One segment's audio, retried, with a voice fallback.
-    // The provider intermittently refuses content that succeeds moments later
-    // (finishReason=OTHER, no audio), and the TTS quota is per-minute, so a
-    // failure here usually means "ask again shortly" rather than "this is broken".
-    // An unknown voice is a 400; it is retried with the verified default pair so
-    // voice variety never costs the episode. Returns {resp, pair}.
-    async function synthesizeSegment(dialogue, voice) {
-        const requested = (voice && voice.length === 2) ? voice : ['Kore', 'Puck'];
-        const pairs = (requested[0] === 'Kore' && requested[1] === 'Puck')
-            ? [requested] : [requested, ['Kore', 'Puck']];
+    // One spoken line, retried. A 429/transport fault is retryable; an auth or
+    // credit failure is not, and stopping on it matters because retrying a
+    // depleted account just burns requests. Throws Error with .fatal set.
+    async function synthesizeLine(speaker, text) {
         const attempts = 3;
         let lastError = 'no attempt made';
-        for (let p = 0; p < pairs.length; p++) {
-            for (let attempt = 1; attempt <= attempts; attempt++) {
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                const resp = await fetch('/api/podcast_audio', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ speaker: speaker, text: text })
+                });
+                if (resp.ok) return resp;
+                let detail = '';
+                let retryable = true;
                 try {
-                    const resp = await fetch('/api/podcast_audio', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ dialogue: dialogue, voices: pairs[p] })
-                    });
-                    if (resp.ok) return { resp: resp, pair: pairs[p] };
-                    let detail = '';
-                    try { detail = (await resp.json()).error || ''; } catch (e) { /* not json */ }
-                    lastError = detail || ('HTTP ' + resp.status);
-                    if (resp.status === 400 && p < pairs.length - 1) break;  // bad voice, try default
-                } catch (e) {
-                    lastError = e.message;
+                    const parsed = await resp.json();
+                    detail = parsed.error || '';
+                    if (parsed.retryable === false) retryable = false;
+                } catch (e) { /* not json */ }
+                lastError = detail || ('HTTP ' + resp.status);
+                if (!retryable) {
+                    const err = new Error(lastError);
+                    err.fatal = true;
+                    throw err;
                 }
-                if (attempt < attempts) await wait(1500 * attempt * attempt);
+            } catch (e) {
+                if (e.fatal) throw e;
+                lastError = e.message;
             }
+            if (attempt < attempts) await wait(1500 * attempt * attempt);
         }
         throw new Error(lastError);
     }
 
-    // Synthesize one episode's audio, pacing itself against the per-minute quota
-    // and collecting failures rather than aborting. Successful clips are cached in
-    // IndexedDB, so retrying only pays for the gaps.
+    // Synthesizes one episode's audio line by line, paced, collecting failures
+    // instead of aborting. Finished lines stay in IndexedDB, so retrying an
+    // episode only pays for the gaps. Sets podcastQuota when Deepgram reports a
+    // non-retryable failure, so the episode loop stops instead of re-asking.
     async function generateAudio(epIndex) {
         const ep = podcast[epIndex];
         if (!ep || !ep.turns.length) return;
-        const segments = buildSegments(ep.turns, 900);
-        const voice = voiceFor(epIndex);
+        const lines = lineSegments(ep);
         podcastStatus.textContent = 'Audio for "' + (ep.title || ep.hook) + '"…';
-        ep.segs = new Array(segments.length);
-        const CONCURRENCY = 1;      // the quota is per-minute; sequential is safer
+        ep.segs = new Array(lines.length);
         let done = 0;
         const failures = [];
 
-        for (let i = 0; i < segments.length; i++) {
-            const dialogue = episodeDialogue(ep, segments[i]);
-            let blob = null, duration = 0, pair = voice;
-            const checkKey = function (p) {
-                return (currentDeckId || 'no-deck') + '|' + p.join(',') + '|' + hashText(dialogue);
-            };
+        for (let i = 0; i < lines.length; i++) {
+            const turn = ep.turns[lines[i]];
+            const speaker = turn.speaker === 'Sam' ? 'Sam' : 'Alex';
+            const cacheKey = (currentDeckId || 'no-deck') + '|' + speaker + '|' + hashText(turn.text);
+            let blob = null, duration = 0;
             try {
-                const cached = await Store.getAudio(checkKey(voice));
+                const cached = await Store.getAudio(cacheKey);
                 if (cached && cached.blob) { blob = cached.blob; duration = cached.duration; }
-                else {
-                    // A previous episode may have had to fall back to the default
-                    // pair; reusing that avoids re-synthesising with a rejected voice.
-                    const alt = await Store.getAudio(checkKey(['Kore', 'Puck']));
-                    if (alt && alt.blob) { blob = alt.blob; duration = alt.duration; }
-                }
             } catch (e) { /* ignore */ }
             if (!blob) {
                 try {
-                    const result = await synthesizeSegment(dialogue, voice);
-                    pair = result.pair;
-                    blob = await result.resp.blob();
-                    duration = parseFloat(result.resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(ep, segments[i]);
-                    await Store.putAudio(checkKey(pair), blob, duration);
+                    const resp = await synthesizeLine(speaker, turn.text);
+                    blob = await resp.blob();
+                    duration = parseFloat(resp.headers.get('X-Audio-Duration') || '0') || estimateDuration(ep, lines[i]);
+                    await Store.putAudio(cacheKey, blob, duration);
                 } catch (e) {
+                    if (e.fatal) {
+                        podcastQuota = true;
+                        podcastStatus.textContent = e.message;
+                        break;
+                    }
                     failures.push(i + 1);
-                    podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length
-                        + ' (segment ' + (i + 1) + ' failed: ' + e.message + ')';
+                    podcastStatus.textContent = 'Audio ' + done + ' / ' + lines.length
+                        + ' (line ' + (i + 1) + ' failed: ' + e.message + ')';
                     continue;
                 }
             }
-            ep.segs[i] = { turns: segments[i], url: URL.createObjectURL(blob), duration: duration };
+            ep.segs[i] = { turns: [lines[i]], url: URL.createObjectURL(blob), duration: duration };
             done++;
-            podcastStatus.textContent = 'Audio ' + done + ' / ' + segments.length;
-            renderEpisodeList();
-            await wait(1200);       // pace against the per-minute TTS quota
+            podcastStatus.textContent = 'Audio ' + done + ' / ' + lines.length;
+            await wait(400);         // one voice request at a time, modestly paced
         }
-        if (failures.length) {
-            podcastStatus.textContent = 'Audio ready for ' + done + ' of ' + segments.length
-                + ' parts of this episode; part' + (failures.length > 1 ? 's ' : ' ') + failures.join(', ')
-                + ' failed. Click the episode again — finished parts are reused.';
-        } else {
-            podcastStatus.textContent = '';
+        if (done) renderEpisodeList();
+        if (!podcastQuota) {
+            podcastStatus.textContent = failures.length
+                ? 'Audio ready for ' + done + ' of ' + lines.length + ' lines; ' + failures.length
+                  + ' failed. Click the episode again - finished lines are reused.'
+                : '';
         }
     }
 
     async function generateAllAudio() {
         if (podcastBusy) return;
         podcastBusy = true;
+        podcastQuota = false;
         podcastGenAllAudio.disabled = true;
         try {
             for (let i = 0; i < podcast.length; i++) {
+                // Once Deepgram reports a failure that retrying cannot fix, asking
+                // again for every remaining episode only wastes requests.
+                if (podcastQuota) {
+                    podcastStatus.textContent += ' Remaining episodes skipped.';
+                    break;
+                }
                 await generateAudio(i);
                 await wait(2500);
             }
@@ -946,9 +933,10 @@
         }
     }
 
-    function estimateDuration(ep, indices) {
-        const chars = indices.reduce(function (s, i) { return s + ep.turns[i].text.length; }, 0);
-        return chars / 15;
+    // Fallback when the provider omits X-Audio-Duration. Measured on Deepgram:
+    // ~14.6 characters of speech per second of audio at normal rate.
+    function estimateDuration(ep, index) {
+        return (ep.turns[index] ? ep.turns[index].text.length : 0) / 14.6;
     }
 
     function episodeDuration(ep) {
@@ -972,7 +960,12 @@
             podAudio = new Audio();
             podAudio.onended = onSegmentEnded;
             podAudio.ontimeupdate = onTimeUpdate;
+            // preservesPitch keeps the voice natural instead of chipmunk-fast;
+            // it is the default on by-supporting browsers, set defensively.
+            podAudio.playbackRate = PLAYBACK_RATE;
+            try { podAudio.preservesPitch = true; } catch (e) { /* unsupported */ }
         }
+        podAudio.playbackRate = PLAYBACK_RATE;
         podAudio.src = ep.segs[i].url;
         podAudio.play().catch(function () {});
         podPlaying = true;
@@ -998,9 +991,11 @@
         if (!seg) return;
         let elapsed = 0;
         for (let i = 0; i < podSegIndex; i++) elapsed += segs[i].duration || 0;
-        elapsed += podAudio.currentTime;
+        // Stored durations are the clip's own seconds; at 1.1x the listener has
+        // spent less wall-clock time than the clip length.
+        elapsed = elapsed / PLAYBACK_RATE + podAudio.currentTime;
         podElapsed = elapsed;
-        const total = episodeDuration(ep);
+        const total = episodeDuration(ep) / PLAYBACK_RATE;
         if (total > 0) miniProgress.style.width = (100 * elapsed / total) + '%';
         miniTime.textContent = fmtTime(elapsed);
         highlightTurn(podSegIndex, seg.duration ? podAudio.currentTime / seg.duration : 0);
@@ -1040,11 +1035,16 @@
         // The bar is fixed over the deck; without clearance it would cover the
         // nav buttons and the keyboard hint on the last thing you try to tap.
         document.body.classList.toggle('pod-open', hasAudio);
-        miniPlay.textContent = podPlaying ? '⏸' : '▶';
+        // Play/pause state is a class, not swapped glyphs: CSS shows the right icon
+        // and the equalizer bars, so no children are ever replaced. (textContent
+        // would erase the inline SVGs.)
+        miniPlayer.classList.toggle('playing', podPlaying);
+        miniPlay.setAttribute('aria-label', podPlaying ? 'Pause podcast' : 'Play podcast');
         miniTitle.textContent = ep ? (ep.title || ep.hook || 'Podcast') : 'Podcast';
         miniTime.textContent = fmtTime(podElapsed);
         if (hasAudio) {
-            const total = episodeDuration(ep);
+            // Same denominator as onTimeUpdate, or the bar and the clock disagree.
+            const total = episodeDuration(ep) / PLAYBACK_RATE;
             if (total > 0) miniProgress.style.width = (100 * podElapsed / total) + '%';
         }
     }
